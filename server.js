@@ -65,18 +65,18 @@ app.get("/stats/:location", async (req, res) => {
 
   try {
     // Leads
-    const contactsRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", { headers });
+    const contactsRes = await axios.get("https://rest.gohighlevel.com/v2/contacts/", { headers });
     const leads = contactsRes.data.contacts.length;
 
     // Appointments
-    const apptRes = await axios.get("https://rest.gohighlevel.com/v1/appointments/", { headers });
+    const apptRes = await axios.get("https://rest.gohighlevel.com/v2/appointments/", { headers });
     const appts = apptRes.data.appointments || [];
     const totalAppts = appts.length;
     const shows = appts.filter(a => a.status === "show").length;
     const noShows = appts.filter(a => a.status === "no show").length;
 
     // Opportunities
-    const oppRes = await axios.get("https://rest.gohighlevel.com/v1/opportunities/", { headers });
+    const oppRes = await axios.get("https://rest.gohighlevel.com/v2/opportunities/", { headers });
     const opps = oppRes.data.opportunities || [];
     const wins = opps.filter(o => o.status === "won").length;
     const losses = opps.filter(o => o.status === "lost").length;
