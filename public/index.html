@@ -1,9 +1,40 @@
-<html>
-  <head>
-    <link rel="stylesheet" href="main.css">
-  </head>
-  <body>
-    <h1>Shoot 360 Dashboard (Preview)</h1>
-    <script src="main.js"></script>
-  </body>
-</html>
+<link rel="stylesheet" href="https://shoot360-lead-dashboard.onrender.com/main.css">
+<script src="https://shoot360-lead-dashboard.onrender.com/main.js" defer></script>
+
+<div id="dashboard" data-location="Portland">
+  <header class="s360-header">
+    <h1>Shoot 360 – Portland</h1>
+    <span class="s360-date">Week of July 22</span>
+  </header>
+
+  <div class="s360-grid">
+    <div class="s360-card">
+      <h2>Total Leads</h2>
+      <p class="s360-count" data-key="leads">0</p>
+    </div>
+    <div class="s360-card">
+      <h2>Appointments</h2>
+      <p class="s360-count" data-key="appointments">0</p>
+    </div>
+    <div class="s360-card">
+      <h2>Shows</h2>
+      <p class="s360-count" data-key="shows">0</p>
+    </div>
+    <div class="s360-card">
+      <h2>No Shows</h2>
+      <p class="s360-count" data-key="noShows">0</p>
+    </div>
+    <div class="s360-card">
+      <h2>Wins</h2>
+      <p class="s360-count" data-key="wins">0</p>
+    </div>
+    <div class="s360-card">
+      <h2>Losses</h2>
+      <p class="s360-count" data-key="losses">0</p>
+    </div>
+  </div>
+
+  <footer class="s360-footer">
+    <span>Last updated: <span id="s360-updated">Just now</span></span>
+  </footer>
+</div>
