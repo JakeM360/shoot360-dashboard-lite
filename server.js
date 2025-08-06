@@ -13,7 +13,7 @@ app.use(cors());
 
 const locations = [];
 
-// STEP 2: Load API keys from CSV at runtime
+// STEP 1: Load API keys from CSV at runtime
 function loadLocationsFromCSV() {
   return new Promise((resolve, reject) => {
     const filePath = path.join(__dirname, "secrets", "api_keys.csv");
@@ -21,11 +21,13 @@ function loadLocationsFromCSV() {
     fs.createReadStream(filePath)
       .pipe(csv())
       .on("data", (row) => {
-        locations.push({
-          slug: row.location.toLowerCase(),
-          label: row.label,
-          apiKey: row.api_key
-        });
+        const slug = (row.location || "").trim().toLowerCase();
+        const label = (row.label || "").trim();
+        const apiKey = (row.api_key || "").trim();
+
+        if (slug && label && apiKey) {
+          locations.push({ slug, label, apiKey });
+        }
       })
       .on("end", () => {
         console.log("Loaded locations:", locations.map(l => l.slug));
@@ -38,13 +40,13 @@ function loadLocationsFromCSV() {
   });
 }
 
-// STEP 3: GET /locations (safe public version)
+// STEP 2: GET /locations (public safe list)
 app.get("/locations", (req, res) => {
   const safeList = locations.map(({ slug, label }) => ({ slug, label }));
   res.json(safeList);
 });
 
-// STEP 4: GET /stats/:location (real data from GHL)
+// STEP 3: GET /stats/:location (real GHL stats)
 app.get("/stats/:location", async (req, res) => {
   const slug = req.params.location.toLowerCase();
   const location = locations.find(l => l.slug === slug);
@@ -59,7 +61,7 @@ app.get("/stats/:location", async (req, res) => {
   };
 
   try {
-    // Leads
+    // Contacts
     const contactsRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", { headers });
     const leads = contactsRes.data.contacts.length;
 
@@ -86,12 +88,12 @@ app.get("/stats/:location", async (req, res) => {
       losses,
     });
   } catch (error) {
-    console.error("Error fetching stats:", error.message);
+    console.error("Error fetching stats from GHL:", error.message);
     res.status(500).json({ error: "Failed to fetch stats from GHL" });
   }
 });
 
-// START SERVER
+// STEP 4: Start the server
 loadLocationsFromCSV().then(() => {
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
