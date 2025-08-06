@@ -1,10 +1,10 @@
 // server.js
-const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const csv = require("csv-parser");
-const cors = require("cors");
-const axios = require("axios");
+const express   = require("express");
+const fs        = require("fs");
+const path      = require("path");
+const csv       = require("csv-parser");
+const cors      = require("cors");
+const axios     = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,7 +12,7 @@ app.use(cors());
 
 let locations = [];
 
-// STEP 1: Load CSV and parse calendar IDs (any number of *_calendar_id columns)
+// STEP 1: Load CSV and parse all calendar IDs
 function loadLocationsFromCSV() {
   return new Promise((resolve, reject) => {
     const filePath = path.join(__dirname, "secrets", "api_keys.csv");
@@ -20,14 +20,14 @@ function loadLocationsFromCSV() {
       .pipe(csv())
       .on("data", (row) => {
         if (!row.location || !row.label || !row.api_key) {
-          console.warn("Skipping CSV row (missing required fields):", row);
+          console.warn("Skipping invalid CSV row:", row);
           return;
         }
-        // collect any calendar IDs
+        // Collect all calendar IDs (youth_calendar_id, adult_calendar_id, etc.)
         const calendars = Object.keys(row)
-          .filter((key) => key.endsWith("_calendar_id") && row[key])
+          .filter((key) => key.endsWith("_calendar_id") && row[key].trim())
           .map((key) => ({
-            name: key.replace("_calendar_id", ""), // e.g. "youth" or "adult"
+            name: key.replace("_calendar_id", ""),
             id: row[key].trim(),
           }));
 
@@ -43,13 +43,13 @@ function loadLocationsFromCSV() {
         resolve();
       })
       .on("error", (err) => {
-        console.error("❌ Error reading CSV:", err);
+        console.error("❌ Error loading CSV:", err);
         reject(err);
       });
   });
 }
 
-// STEP 2: GET /locations → public list for sidebar
+// STEP 2: GET /locations → list of { slug, label }
 app.get("/locations", (req, res) => {
   res.json(locations.map(({ slug, label }) => ({ slug, label })));
 });
@@ -58,16 +58,19 @@ app.get("/locations", (req, res) => {
 app.get("/stats/:location", async (req, res) => {
   const { location } = req.params;
   const { startDate, endDate } = req.query;
+
+  // Validate query params
   if (!startDate || !endDate) {
     return res.status(400).json({
       error: "Missing required query parameters",
       details: {
-        startDate: { message: "The startDate field is mandatory.", rule: "required" },
-        endDate:   { message: "The endDate field is mandatory.",   rule: "required" },
+        startDate: { message: "startDate is required", rule: "required" },
+        endDate:   { message: "endDate is required",   rule: "required" },
       },
     });
   }
 
+  // Find location config
   const loc = locations.find((l) => l.slug === location.toLowerCase());
   if (!loc) {
     return res.status(404).json({ error: "Location not found" });
@@ -79,50 +82,62 @@ app.get("/stats/:location", async (req, res) => {
   };
 
   try {
-    // 1) Fetch leads count
-    const contactsRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", { headers });
+    // 1. Fetch leads within date range
+    const contactsRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
+      headers,
+      params: { startDate, endDate },
+    });
     const leads = Array.isArray(contactsRes.data.contacts)
       ? contactsRes.data.contacts.length
       : 0;
 
-    // 2) Initialize stats
+    // 2. Initialize combined appointment stats
     const combined = { leads, appointments: 0, shows: 0, noShows: 0 };
     const calendars = {};
 
-    // 3) Fetch stats for each calendar
+    // 3. Fetch appointments per calendar
     await Promise.all(
       loc.calendars.map(async (cal) => {
         try {
-          const url = "https://rest.gohighlevel.com/v1/appointments/stats";
-          const resp = await axios.get(url, {
+          const resp = await axios.get("https://rest.gohighlevel.com/v1/appointments/", {
             headers,
-            params: { calendarId: cal.id, startDate, endDate },
+            params: {
+              calendarId: cal.id,
+              startDate,
+              endDate,
+            },
           });
-          const stats = resp.data;
 
-          // record per-calendar
-          calendars[cal.name] = stats;
+          const appts = Array.isArray(resp.data.appointments)
+            ? resp.data.appointments
+            : [];
 
-          // accumulate into combined
-          combined.appointments += stats.appointments || 0;
-          combined.shows        += stats.shows        || 0;
-          combined.noShows      += stats.noShows      || 0;
+          const total   = appts.length;
+          const shows   = appts.filter((a) => a.status === "show").length;
+          const noShows = appts.filter((a) => a.status === "no show").length;
+
+          // Record per-calendar
+          calendars[cal.name] = { total, shows, noShows };
+
+          // Accumulate into combined
+          combined.appointments += total;
+          combined.shows        += shows;
+          combined.noShows      += noShows;
         } catch (err) {
-          console.error(`⚠️ Calendar ${cal.name} error:`, err.response?.data || err.message);
+          console.error(`⚠ Calendar ${cal.name} error:`, err.response?.data || err.message);
           calendars[cal.name] = { error: true, details: err.response?.data || err.message };
         }
       })
     );
 
-    // 4) Return JSON
+    // 4. Return combined + breakdown
     res.json({
       location: loc.label,
       combined,
       calendars,
     });
-
   } catch (err) {
-    console.error("❌ GHL API error:", err.response?.data || err.message);
+    console.error("❌ Error fetching stats:", err.response?.data || err.message);
     res.status(500).json({
       error: "Failed to fetch stats from GHL",
       details: err.response?.data || err.message,
@@ -130,7 +145,7 @@ app.get("/stats/:location", async (req, res) => {
   }
 });
 
-// STEP 4: Start server after CSV loads
+// STEP 4: Start the server once CSV is loaded
 loadLocationsFromCSV()
   .then(() => {
     app.listen(PORT, () => {
