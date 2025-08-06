@@ -3,8 +3,8 @@ require("dotenv").config();
 const express = require("express");
 const axios   = require("axios");
 const cors    = require("cors");
-
 const app = express();
+const GHL_API_KEY = process.env.GHL_API_KEY;
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
