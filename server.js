@@ -10,9 +10,9 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-const locations = [];
+let locations = [];
 
-// Load locations and API keys from CSV
+// STEP 1: Load CSV and parse all calendar IDs
 function loadLocationsFromCSV() {
   return new Promise((resolve, reject) => {
     const filePath = path.join(__dirname, "secrets", "api_keys.csv");
@@ -20,18 +20,33 @@ function loadLocationsFromCSV() {
     fs.createReadStream(filePath)
       .pipe(csv())
       .on("data", (row) => {
-        if (row.location && row.api_key) {
-          locations.push({
-            slug: row.location.toLowerCase().trim(),
-            label: row.label || row.location,
-            apiKey: row.api_key.trim(),
-          });
-        } else {
+        // Basic validation
+        if (!row.location || !row.label || !row.api_key) {
           console.warn("Skipping invalid row in CSV:", row);
+          return;
         }
+
+        const calendarIds = [];
+
+        // Dynamically extract calendar IDs
+        Object.keys(row).forEach((key) => {
+          if (key.startsWith("calendar_") && row[key]) {
+            calendarIds.push({
+              name: key.replace("calendar_", "").replace("_id", ""), // e.g., youth or adult
+              id: row[key],
+            });
+          }
+        });
+
+        locations.push({
+          slug: row.location.toLowerCase(),
+          label: row.label,
+          apiKey: row.api_key,
+          calendars: calendarIds,
+        });
       })
       .on("end", () => {
-        console.log("Loaded locations:", locations.map(l => l.slug));
+        console.log("Loaded locations:", locations.map((l) => l.slug));
         resolve();
       })
       .on("error", (err) => {
@@ -41,16 +56,16 @@ function loadLocationsFromCSV() {
   });
 }
 
-// Return public list of locations
+// STEP 2: Public list of locations
 app.get("/locations", (req, res) => {
   const safeList = locations.map(({ slug, label }) => ({ slug, label }));
   res.json(safeList);
 });
 
-// Return GHL stats for a specific location
+// STEP 3: Stats route with calendar merging and breakdown
 app.get("/stats/:location", async (req, res) => {
   const slug = req.params.location.toLowerCase();
-  const location = locations.find(l => l.slug === slug);
+  const location = locations.find((l) => l.slug === slug);
 
   if (!location) {
     return res.status(404).json({ error: "Location not found" });
@@ -61,47 +76,62 @@ app.get("/stats/:location", async (req, res) => {
     "Content-Type": "application/json",
   };
 
-  console.log(`Fetching stats for ${slug} using key:`, location.apiKey.slice(0, 10) + "...");
-
   try {
-    // Leads
-    const contactsRes = await axios.get("https://rest.gohighlevel.com/v2/contacts/", { headers });
+    // Fetch leads
+    const contactsRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", { headers });
     const leads = contactsRes.data.contacts.length;
 
-    // Appointments
-    const apptRes = await axios.get("https://rest.gohighlevel.com/v2/appointments/", { headers });
-    const appts = apptRes.data.appointments || [];
-    const totalAppts = appts.length;
-    const shows = appts.filter(a => a.status === "show").length;
-    const noShows = appts.filter(a => a.status === "no show").length;
+    // Combined stats
+    const combinedStats = {
+      leads,
+      appointments: 0,
+      shows: 0,
+      noShows: 0,
+    };
 
-    // Opportunities
-    const oppRes = await axios.get("https://rest.gohighlevel.com/v2/opportunities/", { headers });
-    const opps = oppRes.data.opportunities || [];
-    const wins = opps.filter(o => o.status === "won").length;
-    const losses = opps.filter(o => o.status === "lost").length;
+    const calendarStats = {};
 
+    // Loop through all calendar IDs
+    for (const cal of location.calendars) {
+      const url = `https://rest.gohighlevel.com/v1/appointments/?calendarId=${cal.id}`;
+      const apptRes = await axios.get(url, { headers });
+
+      const appts = apptRes.data.appointments || [];
+
+      const shows = appts.filter((a) => a.status === "show").length;
+      const noShows = appts.filter((a) => a.status === "no show").length;
+      const total = appts.length;
+
+      // Update per-calendar stats
+      calendarStats[cal.name] = {
+        calendarId: cal.id,
+        total,
+        shows,
+        noShows,
+      };
+
+      // Update combined stats
+      combinedStats.appointments += total;
+      combinedStats.shows += shows;
+      combinedStats.noShows += noShows;
+    }
+
+    // Return both combined and individual stats
     res.json({
       location: location.label,
-      leads,
-      appointments: totalAppts,
-      shows,
-      noShows,
-      wins,
-      losses,
+      combined: combinedStats,
+      calendars: calendarStats,
     });
-
   } catch (error) {
-    console.error("GHL API error:", error.response?.status, error.response?.data || error.message);
+    console.error("GHL API error:", error.response?.data || error.message);
     res.status(500).json({
       error: "Failed to fetch stats from GHL",
-      message: error.response?.data?.message || error.message,
-      status: error.response?.status || 500,
+      details: error.response?.data || error.message,
     });
   }
 });
 
-// Start server after CSV loads
+// STEP 4: Start server after CSV loads
 loadLocationsFromCSV().then(() => {
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
