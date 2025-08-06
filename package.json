@@ -1,5 +1,5 @@
 {
-  "name": "shoot360-lead-dashboard",
+  "name": "shoot360-dashboard-lite",
   "version": "1.0.0",
   "description": "Internal dashboard for Shoot 360 location performance",
   "main": "server.js",
@@ -10,6 +10,7 @@
   "author": "Shoot 360",
   "license": "MIT",
   "dependencies": {
+    "axios": "^1.6.7",
     "cors": "^2.8.5",
     "csv-parser": "^3.0.0",
     "dotenv": "^16.3.1",
