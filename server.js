@@ -22,25 +22,25 @@ const agencyHeaders = {
   "Content-Type": "application/json",
 };
 
-// In-memory cache for locations
+// Cache for locations
 let locationsCache = [];
 
 // STEP A: Fetch sub-accounts and merge per-location API keys & calendars
 async function initialize() {
-  // A1: Fetch locations
+  // 1) Fetch locations with agency key
   const locResp = await axios.get("https://rest.gohighlevel.com/v1/locations", { headers: agencyHeaders });
   locationsCache = (locResp.data.locations || []).map(loc => {
     const raw = loc.name.replace(/^Shoot 360\s*-\s*/, "");
     return {
-      id:   loc.id,
-      name: loc.name,
-      slug: raw.toLowerCase().replace(/\s+/g, "-"),
-      apiKey: null,
-      calendars: []
+      id:      loc.id,
+      name:    loc.name,
+      slug:    raw.toLowerCase().replace(/\s+/g, "-"),
+      apiKey:  null,
+      calendars: []  // still available for future
     };
   });
 
-  // A2: Load CSV of per-location API keys & calendars
+  // 2) Load your per‐location API keys from CSV
   await new Promise((resolve, reject) => {
     fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
       .pipe(csv())
@@ -48,19 +48,16 @@ async function initialize() {
         const slug = row.location.toLowerCase().trim();
         const loc  = locationsCache.find(l => l.slug === slug);
         if (!loc) return;
-        loc.apiKey    = row.api_key.trim();
-        loc.calendars = Object.keys(row)
-          .filter(k => k.endsWith("_calendar_id") && row[k].trim())
-          .map(k => ({ name: k.replace("_calendar_id", ""), id: row[k].trim() }));
+        loc.apiKey = row.api_key.trim();
       })
       .on("end", resolve)
       .on("error", reject);
   });
 
-  console.log("✅ Initialized locations with API keys & calendars:", locationsCache.map(l => l.slug));
+  console.log("✅ Initialized:", locationsCache.map(l => l.slug));
 }
 
-// STEP B: Default to last 30 days or use query
+// STEP B: Date range helper (last 30 days default)
 function getDateRange(req) {
   const now = Date.now();
   let start = now - 1000*60*60*24*30, end = now;
@@ -75,16 +72,16 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// STEP C: GET /locations
+// GET /locations → sidebar
 app.get("/locations", (req, res) => {
   res.json(locationsCache.map(({ id, name, slug }) => ({ id, name, slug })));
 });
 
-// STEP D: GET /stats/:location
+// GET /stats/:location → metrics
 app.get("/stats/:location", async (req, res) => {
   const loc = locationsCache.find(l => l.slug === req.params.location.toLowerCase());
   if (!loc) return res.status(404).json({ error: "Location not found" });
-  if (!loc.apiKey) return res.status(500).json({ error: "No API key for this location" });
+  if (!loc.apiKey) return res.status(500).json({ error: "Missing API key for location" });
 
   const { start, end } = getDateRange(req);
   const headers = {
@@ -92,7 +89,7 @@ app.get("/stats/:location", async (req, res) => {
     "Content-Type":  "application/json"
   };
 
-  // 1) Fetch Leads via Contacts
+  // 1) Fetch & filter leads via Contacts
   let leads = 0;
   try {
     const cRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
@@ -101,77 +98,68 @@ app.get("/stats/:location", async (req, res) => {
     });
     leads = (cRes.data.contacts || [])
       .filter(c => {
-        const d = Date.parse(c.dateCreated);
-        return d >= start && d <= end;
+        const t = Date.parse(c.dateCreated);
+        return t >= start && t <= end;
       }).length;
   } catch (e) {
     console.error("⚠ Contacts error:", e.response?.data || e.message);
   }
 
-  // 2) Fetch pipelines for this location via API key
-  let pipelinesList = [];
+  // 2) Fetch & filter all opportunities once
+  let opps = [];
   try {
-    const pRes = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
+    const oRes = await axios.get("https://rest.gohighlevel.com/v1/opportunities/", {
       headers,
       params: { locationId: loc.id }
     });
-    pipelinesList = (pRes.data.pipelines || []).filter(p =>
-      ["Youth","Adult","Leagues"].includes(p.name)
-    );
+    opps = (oRes.data.opportunities || [])
+      .filter(o => {
+        const t = Date.parse(o.dateCreated);
+        return t >= start && t <= end;
+      });
   } catch (e) {
-    console.error("⚠ Pipelines error:", e.response?.data || e.message);
+    console.error("⚠ Opportunities error:", e.response?.data || e.message);
   }
 
-  // 3) For each pipeline, fetch its opportunities and tally metrics
-  const combined = { leads, appointments: 0, shows: 0, noShows: 0, wins: 0, cold: 0 };
-  const pipelines = {};
+  // 3) Tally combined
+  const combined = {
+    leads,
+    appointments: opps.length,
+    shows:        opps.filter(o => o.tags?.includes("show")).length,
+    noShows:      opps.filter(o => o.tags?.includes("no-show")).length,
+    wins:         opps.filter(o => o.tags?.includes("won")).length,
+    cold:         opps.filter(o => o.tags?.includes("cold")).length,
+  };
 
-  await Promise.all(pipelinesList.map(async (p) => {
-    try {
-      const oRes = await axios.get("https://rest.gohighlevel.com/v1/opportunities/", {
-        headers,
-        params: {
-          locationId: loc.id,
-          pipelineId: p.id,
-          startDate:  start,
-          endDate:    end
-        }
-      });
-      const opps = oRes.data.opportunities || [];
-      const total   = opps.length;
-      const shows   = opps.filter(o => o.tags?.includes("show")).length;
-      const noShows = opps.filter(o => o.tags?.includes("no-show")).length;
-      const wins    = opps.filter(o => o.tags?.includes("won")).length;
-      const cold    = opps.filter(o => o.tags?.includes("cold")).length;
+  // 4) Pipeline breakdown by tags
+  const pipelines = ["youth","adult","leagues"].reduce((acc, name) => {
+    const list = opps.filter(o => o.tags?.includes(name));
+    acc[name] = {
+      total:   list.length,
+      shows:   list.filter(o => o.tags.includes("show")).length,
+      noShows: list.filter(o => o.tags.includes("no-show")).length,
+      wins:    list.filter(o => o.tags.includes("won")).length,
+      cold:    list.filter(o => o.tags.includes("cold")).length,
+    };
+    return acc;
+  }, {});
 
-      pipelines[p.name.toLowerCase()] = { total, shows, noShows, wins, cold };
-
-      combined.appointments += total;
-      combined.shows        += shows;
-      combined.noShows      += noShows;
-      combined.wins         += wins;
-      combined.cold         += cold;
-    } catch (e) {
-      console.error(`⚠ Pipeline ${p.name} error:`, e.response?.data || e.message);
-      pipelines[p.name.toLowerCase()] = { error:true, details: e.response?.data || e.message };
-    }
-  }));
-
+  // 5) Return payload
   res.json({
-    location:  loc.name,
+    location: loc.name,
     dateRange: {
       startDate: new Date(start).toISOString().slice(0,10),
-      endDate:   new Date(end).toISOString().slice(0,10)
+      endDate:   new Date(end).toISOString().slice(0,10),
     },
     combined,
-    pipelines
+    pipelines,
   });
 });
 
-// STEP E: Initialize and start
+// STEP E: Initialize & start
 initialize()
-  .then(() => app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`)))
   .catch(err => {
-    console.error("❌ Initialization failed:", err);
+    console.error("❌ Init failed:", err);
     process.exit(1);
   });
