@@ -28,12 +28,17 @@ async function loadLocations() {
     const resp = await axios.get("https://rest.gohighlevel.com/v1/locations", {
       headers: ghHeaders,
     });
-    // Expecting { locations: [ { id, name, ... }, ... ] }
-    locationsCache = (resp.data.locations || []).map((loc) => ({
-      id:   loc.id,
-      name: loc.name,
-      slug: loc.name.toLowerCase().replace(/\s+/g, "-"),
-    }));
+    // Build and assign to locationsCache
+    locationsCache = (resp.data.locations || []).map((loc) => {
+      // Strip "Shoot 360 - " prefix for clean slugs
+      const rawName = loc.name.replace(/^Shoot 360\s*-\s*/, "");
+      return {
+        id:   loc.id,
+        name: loc.name,
+        slug: rawName.toLowerCase().replace(/\s+/g, "-"),
+      };
+    });
+
     console.log("✅ Loaded locations:", locationsCache.map((l) => l.slug));
   } catch (e) {
     console.error("❌ Error loading locations:", e.response?.data || e.message);
@@ -81,12 +86,12 @@ app.get("/stats/:location", async (req, res) => {
       ? allOpp.data.opportunities
       : [];
     const combined = {
-      leads:       oppsAll.length,
+      leads:        oppsAll.length,
       appointments: 0,
-      shows:       0,
-      noShows:     0,
-      wins:        0,
-      cold:        0,
+      shows:        0,
+      noShows:      0,
+      wins:         0,
+      cold:         0,
     };
 
     // 2) Fetch pipelines for this location
@@ -122,9 +127,7 @@ app.get("/stats/:location", async (req, res) => {
           const wins    = opps.filter((o) => o.tags?.includes("won")).length;
           const cold    = opps.filter((o) => o.tags?.includes("cold")).length;
 
-          pipelineStats[p.name.toLowerCase()] = {
-            total, shows, noShows, wins, cold,
-          };
+          pipelineStats[p.name.toLowerCase()] = { total, shows, noShows, wins, cold };
 
           combined.appointments += total;
           combined.shows        += shows;
@@ -134,7 +137,7 @@ app.get("/stats/:location", async (req, res) => {
         } catch (err) {
           console.error(`⚠ Pipeline ${p.name} error:`, err.response?.data || err.message);
           pipelineStats[p.name.toLowerCase()] = {
-            error: true,
+            error:   true,
             details: err.response?.data || err.message,
           };
         }
@@ -144,7 +147,10 @@ app.get("/stats/:location", async (req, res) => {
     // 4) Return the response
     res.json({
       location:  loc.name,
-      dateRange: { startDate: new Date(startTs).toISOString().slice(0,10), endDate: new Date(endTs).toISOString().slice(0,10) },
+      dateRange: {
+        startDate: new Date(startTs).toISOString().slice(0,10),
+        endDate:   new Date(endTs).toISOString().slice(0,10),
+      },
       combined,
       pipelines: pipelineStats,
     });
