@@ -22,7 +22,7 @@ const agencyHeaders = {
   "Content-Type": "application/json"
 };
 
-// 2) Load CSV: slug → private API key
+// 2) Load your CSV: slug → private API key
 const rawLocations = [];
 fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
   .pipe(csv())
@@ -35,14 +35,12 @@ fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
   })
   .on("end", () => console.log("🔑 Loaded CSV for:", rawLocations.map(r => r.slug)));
 
-// 3) Helper: default last 30 days or ?startDate&endDate
+// 3) Date‐range helper (defaults to last 30 days)
 function getDateRange(req) {
   const now = Date.now();
-  let start = now - 1000 * 60 * 60 * 24 * 30,
-      end   = now;
+  let start = now - 1000*60*60*24*30, end = now;
   if (req.query.startDate && req.query.endDate) {
-    const s = Date.parse(req.query.startDate),
-          e = Date.parse(req.query.endDate);
+    const s = Date.parse(req.query.startDate), e = Date.parse(req.query.endDate);
     if (!isNaN(s) && !isNaN(e)) {
       start = s;
       end   = e + 86399999;
@@ -51,7 +49,7 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// 4) Fetch all contacts for a sub-account
+// 4) Helper: fetch ALL contacts for a sub‐account
 async function fetchAllContacts(apiKey, locationId) {
   const all = [];
   let page = 1, perPage = 50;
@@ -68,19 +66,39 @@ async function fetchAllContacts(apiKey, locationId) {
   return all;
 }
 
-// 5) Runtime map: slug → { id, apiKey, pipelines }
+// 5) Helper: fetch ALL opportunities for one pipeline
+async function fetchAllPipelineOpps(apiKey, locationId, pipelineId) {
+  const all = [];
+  let page = 1, perPage = 50;
+  while (true) {
+    const resp = await axios.get(
+      `https://rest.gohighlevel.com/v1/pipelines/${pipelineId}/opportunities`,
+      {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        params:  { locationId, page, perPage }
+      }
+    );
+    const batch = resp.data.opportunities || [];
+    all.push(...batch);
+    if (batch.length < perPage) break;
+    page++;
+  }
+  return all;
+}
+
+// 6) Runtime map: slug → { id, apiKey, pipelines:[{name,id,stageIds}] }
 const locations = {};
 
-// 6) Initialization: fetch sub-account IDs, merge CSV, fetch pipelines & stageIds
+// 7) Initialization: fetch sub-account IDs, merge CSV, discover pipelines & stages
 async function initialize() {
-  // A) fetch sub-accounts with agency key
+  // A) list sub‐accounts with agency key
   const { data: locData } = await axios.get(
     "https://rest.gohighlevel.com/v1/locations",
     { headers: agencyHeaders }
   );
   const agList = locData.locations || [];
 
-  // B) merge CSV entries
+  // B) merge CSV entries into our `locations` map
   for (const raw of rawLocations) {
     const match = agList.find(l =>
       l.name.toLowerCase().includes(raw.csvName.toLowerCase())
@@ -90,18 +108,16 @@ async function initialize() {
       continue;
     }
     locations[raw.slug] = {
-      id:      match.id,
-      apiKey:  raw.apiKey,
+      id:        match.id,
+      apiKey:    raw.apiKey,
       pipelines: []
     };
   }
-
   console.log("✅ Initialized locations:", Object.keys(locations));
 
-  // C) for each sub-account, discover pipelines & their stage IDs
+  // C) for each sub-account, fetch its pipelines & stage IDs
   await Promise.all(Object.entries(locations).map(async ([slug, loc]) => {
     const hdr = { Authorization: `Bearer ${loc.apiKey}`, "Content-Type":"application/json" };
-    // 1) list pipelines
     let pipes = [];
     try {
       const r = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
@@ -112,15 +128,14 @@ async function initialize() {
     } catch (e) {
       console.error(`❌ pipelines lookup failed for ${slug}:`, e.message);
     }
-    // 2) for each Youth/Adult/Leagues pipeline, fetch its stages
     for (const p of pipes.filter(p => ["Youth","Adult","Leagues"].includes(p.name))) {
-      const pi = { name: p.name.toLowerCase(), id: p.id, stageIds: {} };
+      const pi = { name:p.name.toLowerCase(), id:p.id, stageIds:{} };
       try {
         const d = await axios.get(
           `https://rest.gohighlevel.com/v1/pipelines/${p.id}`,
           { headers: hdr, params: { locationId: loc.id } }
         );
-        (d.data.pipeline.stages || []).forEach(s => {
+        (d.data.pipeline.stages||[]).forEach(s => {
           pi.stageIds[s.name.toLowerCase().replace(/\s+/g,"-")] = s.id;
         });
       } catch (e) {
@@ -129,48 +144,44 @@ async function initialize() {
       loc.pipelines.push(pi);
     }
   }));
-
   console.log("✅ Pipelines & stages fetched");
 }
 
-// 7) GET /locations → list available slugs
+// 8) GET /locations → list your slugs
 app.get("/locations", (req, res) => {
   res.json(Object.keys(locations));
 });
 
-// 8) GET /stats/:location → hybrid headcount-leads & tag-based outcomes
+// 9) GET /stats/:location → headcount‐leads + tag‐based outcomes
 app.get("/stats/:location", async (req, res) => {
   const slug = req.params.location.toLowerCase();
   const loc  = locations[slug];
-  if (!loc) {
-    return res.status(404).json({ error: "Location not configured" });
-  }
+  if (!loc) return res.status(404).json({ error: "Location not configured" });
 
   const { start, end } = getDateRange(req);
-  const hdr = { Authorization: `Bearer ${loc.apiKey}`, "Content-Type":"application/json" };
 
-  // A) HEADCOUNT leads via pipeline-stage (no date filter)
+  // A) HEADCOUNT Leads via pipeline‐stage
   const combined = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
   const pipelinesOut = {};
 
   for (const p of loc.pipelines) {
     pipelinesOut[p.name] = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
+
+    // fetch EVERY opp in this pipeline
     let opps = [];
     try {
-      const r = await axios.get(
-        `https://rest.gohighlevel.com/v1/pipelines/${p.id}/opportunities`,
-        { headers: hdr, params: { locationId: loc.id } }
-      );
-      opps = r.data.opportunities || [];
+      opps = await fetchAllPipelineOpps(loc.apiKey, loc.id, p.id);
     } catch (e) {
       console.warn(`⚠ opps fetch failed for ${slug}/${p.name}:`, e.message);
     }
+
+    // count only those currently in the Lead stage
     const headcount = opps.filter(o => o.stageId === p.stageIds["lead"]).length;
     pipelinesOut[p.name].leads = headcount;
     combined.leads += headcount;
   }
 
-  // B) tag-based outcomes via contacts & dateUpdated
+  // B) Tag‐based Appointments/Shows/etc via Contacts & dateUpdated
   let contacts = [];
   try {
     contacts = await fetchAllContacts(loc.apiKey, loc.id);
@@ -207,7 +218,7 @@ app.get("/stats/:location", async (req, res) => {
     }
   }
 
-  // 9) Return JSON
+  // 10) Return assembled JSON
   res.json({
     location: slug,
     dateRange: {
@@ -219,7 +230,7 @@ app.get("/stats/:location", async (req, res) => {
   });
 });
 
-// 10) Start server after initialization
+// 11) Start server
 initialize()
   .then(() => app.listen(PORT, () => console.log(`🚀 Dashboard listening on port ${PORT}`)))
   .catch(err => {
