@@ -8,10 +8,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 
-// Your agency‐level key in Render’s env vars
 const GHL_API_KEY = process.env.GHL_API_KEY;
 if (!GHL_API_KEY) {
-  console.error("❌ Missing GHL_API_KEY in environment");
+  console.error("❌ Missing GHL_API_KEY");
   process.exit(1);
 }
 const ghHeaders = {
@@ -19,30 +18,25 @@ const ghHeaders = {
   "Content-Type": "application/json",
 };
 
-// In‐memory cache for sub‐accounts
+// cache locations on startup
 let locationsCache = [];
-
-// STEP A: Load all locations on startup
 async function loadLocations() {
   try {
-    const resp = await axios.get("https://rest.gohighlevel.com/v1/locations", {
-      headers: ghHeaders,
-    });
-    locationsCache = (resp.data.locations || []).map((loc) => {
+    const { data } = await axios.get("https://rest.gohighlevel.com/v1/locations", { headers: ghHeaders });
+    locationsCache = (data.locations || []).map(loc => {
       const raw = loc.name.replace(/^Shoot 360\s*-\s*/, "");
       return {
         id:   loc.id,
         name: loc.name,
-        slug: raw.toLowerCase().replace(/\s+/g, "-"),
+        slug: raw.toLowerCase().replace(/\s+/g, "-")
       };
     });
-    console.log("✅ Locations:", locationsCache.map((l) => l.slug));
+    console.log("✅ Locations:", locationsCache.map(l => l.slug));
   } catch (e) {
-    console.error("❌ Error loading locations:", e.response?.data || e.message);
+    console.error("❌ Failed to load locations", e.response?.data || e.message);
   }
 }
 
-// STEP B: Default to last 30 days
 function getDateRange(req) {
   const now = Date.now();
   let start = now - 1000*60*60*24*30, end = now;
@@ -57,96 +51,86 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// STEP C: Return all locations
+// GET /locations
 app.get("/locations", (req, res) => {
   res.json(locationsCache);
 });
 
-// STEP D: Stats per‐location
+// GET /stats/:location
 app.get("/stats/:location", async (req, res) => {
-  const slug = req.params.location.toLowerCase();
-  const loc  = locationsCache.find((l) => l.slug === slug);
+  const loc = locationsCache.find(l => l.slug === req.params.location.toLowerCase());
   if (!loc) return res.status(404).json({ error: "Location not found" });
 
   const { start, end } = getDateRange(req);
 
-  // 1) LEADS via Contacts endpoint
+  // 1) Leads via Contacts
   let leads = 0;
   try {
-    const cRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
+    const c = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
       headers: ghHeaders,
-      params: { locationId: loc.id, startDate: start, endDate: end },
+      params: { locationId: loc.id }
     });
-    leads = Array.isArray(cRes.data.contacts) ? cRes.data.contacts.length : 0;
+    // filter by dateCreated client-side
+    leads = (c.data.contacts || []).filter(ct =>
+      Date.parse(ct.dateCreated) >= start && Date.parse(ct.dateCreated) <= end
+    ).length;
   } catch (e) {
     console.error("⚠ Contacts error:", e.response?.data || e.message);
   }
 
-  // Prepare combined metrics
-  const combined = { leads, appointments: 0, shows: 0, noShows: 0, wins: 0, cold: 0 };
-  const pipelineStats = {};
-
+  // 2) All opportunities once
+  let oppsAll = [];
   try {
-    // 2) Get pipelines for this location
-    const pRes = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
+    const o = await axios.get("https://rest.gohighlevel.com/v1/opportunities/", {
       headers: ghHeaders,
-      params: { locationId: loc.id },
+      params: { locationId: loc.id }
     });
-    const pipelines = (pRes.data.pipelines || []).filter(p =>
-      ["Youth","Adult","Leagues"].includes(p.name)
-    );
-
-    // 3) Fetch opportunities per pipeline
-    await Promise.all(pipelines.map(async (p) => {
-      try {
-        const oRes = await axios.get("https://rest.gohighlevel.com/v1/opportunities/", {
-          headers: ghHeaders,
-          params: {
-            locationId: loc.id,
-            pipelineId: p.id,
-            startDate:  start,
-            endDate:    end
-          }
-        });
-        const opps = Array.isArray(oRes.data.opportunities) ? oRes.data.opportunities : [];
-
-        // Tally by tag
-        const total   = opps.length;
-        const shows   = opps.filter(o => o.tags?.includes("show")).length;
-        const noShows = opps.filter(o => o.tags?.includes("no-show")).length;
-        const wins    = opps.filter(o => o.tags?.includes("won")).length;
-        const cold    = opps.filter(o => o.tags?.includes("cold")).length;
-
-        pipelineStats[p.name.toLowerCase()] = { total, shows, noShows, wins, cold };
-
-        // Add into combined
-        combined.appointments += total;
-        combined.shows        += shows;
-        combined.noShows      += noShows;
-        combined.wins         += wins;
-        combined.cold         += cold;
-      } catch (e) {
-        console.error(`⚠ Pipeline ${p.name} error:`, e.response?.data || e.message);
-        pipelineStats[p.name.toLowerCase()] = { error:true, details: e.response?.data||e.message };
-      }
-    }));
+    oppsAll = o.data.opportunities || [];
   } catch (e) {
-    console.error("❌ Pipeline fetch error:", e.response?.data || e.message);
+    console.error("⚠ Opps fetch error:", e.response?.data || e.message);
   }
 
-  // 4) Return JSON
-  res.json({
-    location:  loc.name,
+  // filter opps by dateCreated
+  oppsAll = oppsAll.filter(o => {
+    const d = Date.parse(o.dateCreated);
+    return d >= start && d <= end;
+  });
+
+  // combined stats
+  const combined = {
+    leads,
+    appointments: oppsAll.length,
+    shows:   oppsAll.filter(o => o.tags?.includes("show")).length,
+    noShows: oppsAll.filter(o => o.tags?.includes("no-show")).length,
+    wins:    oppsAll.filter(o => o.tags?.includes("won")).length,
+    cold:    oppsAll.filter(o => o.tags?.includes("cold")).length
+  };
+
+  // pipeline breakdown by tags
+  const pipelines = ["youth", "adult", "leagues"].reduce((acc, name) => {
+    const list = oppsAll.filter(o => o.tags?.includes(name));
+    acc[name] = {
+      total:   list.length,
+      shows:   list.filter(o => o.tags.includes("show")).length,
+      noShows: list.filter(o => o.tags.includes("no-show")).length,
+      wins:    list.filter(o => o.tags.includes("won")).length,
+      cold:    list.filter(o => o.tags.includes("cold")).length
+    };
+    return acc;
+  }, {});
+
+  return res.json({
+    location: loc.name,
     dateRange: {
       startDate: new Date(start).toISOString().slice(0,10),
       endDate:   new Date(end).toISOString().slice(0,10)
     },
     combined,
-    pipelines: pipelineStats
+    pipelines
   });
 });
 
-// STEP E: Start after loading locations
+// start
 loadLocations().then(() => {
-  app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`));
+  app.listen(PORT, () => console.log(`🚀 on port ${PORT}`));
 });
