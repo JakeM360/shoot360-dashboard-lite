@@ -11,9 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 
-// ——————————————
-// 1) Agency key (only to list sub-accounts & pipelines)
-// ——————————————
+// Agency key (only to list sub-accounts)
 const AGENCY_API_KEY = process.env.GHL_API_KEY;
 if (!AGENCY_API_KEY) {
   console.error("❌ Missing GHL_API_KEY in environment");
@@ -21,16 +19,15 @@ if (!AGENCY_API_KEY) {
 }
 const agencyHeaders = {
   Authorization: `Bearer ${AGENCY_API_KEY}`,
-  "Content-Type": "application/json",
+  "Content-Type":  "application/json",
 };
 
-// ——————————————
-// 2) Load and merge sub-accounts + per-location keys
-// ——————————————
+// In-memory cache of locations
 let locationsCache = [];
 
+// STEP A: Initialize — fetch sub-accounts, merge per-location keys
 async function initialize() {
-  // A) List all sub-accounts
+  // 1) List sub-accounts with agency key
   const { data: locData } = await axios.get(
     "https://rest.gohighlevel.com/v1/locations",
     { headers: agencyHeaders }
@@ -38,14 +35,14 @@ async function initialize() {
   locationsCache = (locData.locations || []).map((loc) => {
     const raw = loc.name.replace(/^Shoot 360\s*-\s*/, "");
     return {
-      id:   loc.id,
-      name: loc.name,
-      slug: raw.toLowerCase().replace(/\s+/g, "-"),
+      id:    loc.id,
+      name:  loc.name,
+      slug:  raw.toLowerCase().replace(/\s+/g, "-"),
       apiKey: null,
     };
   });
 
-  // B) Merge sub-account API keys from CSV
+  // 2) Load API keys CSV to merge sub-account keys
   await new Promise((resolve, reject) => {
     fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
       .pipe(csv())
@@ -58,15 +55,13 @@ async function initialize() {
       .on("error", reject);
   });
 
-  console.log("✅ Initialized locations:", locationsCache.map((l) => l.slug));
+  console.log("✅ Locations initialized:", locationsCache.map((l) => l.slug));
 }
 
-// ——————————————
-// 3) Date range helper
-// ——————————————
+// STEP B: Date range helper (last 30d default)
 function getDateRange(req) {
   const now = Date.now();
-  let start = now - 1000 * 60 * 60 * 24 * 30,
+  let start = now - 1000*60*60*24*30,
       end   = now;
   if (req.query.startDate && req.query.endDate) {
     const s = Date.parse(req.query.startDate),
@@ -79,16 +74,12 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// ——————————————
-// 4) GET /locations
-// ——————————————
+// GET /locations → id, name, slug
 app.get("/locations", (req, res) => {
   res.json(locationsCache.map(({ id, name, slug }) => ({ id, name, slug })));
 });
 
-// ——————————————
-// 5) GET /stats/:location
-// ——————————————
+// GET /stats/:location
 app.get("/stats/:location", async (req, res) => {
   const slug = req.params.location.toLowerCase();
   const loc  = locationsCache.find((l) => l.slug === slug);
@@ -97,36 +88,42 @@ app.get("/stats/:location", async (req, res) => {
 
   const { start, end } = getDateRange(req);
 
-  // — Contacts (leads) via sub-account key
+  // 1) Leads via Contacts (sub-account key)
   let leads = 0;
   try {
     const { data: cData } = await axios.get(
       "https://rest.gohighlevel.com/v1/contacts/",
-      { headers: { Authorization:`Bearer ${loc.apiKey}` }, params:{ locationId: loc.id } }
+      {
+        headers: { Authorization: `Bearer ${loc.apiKey}` },
+        params: { locationId: loc.id }
+      }
     );
     leads = (cData.contacts || []).filter(c => {
       const t = Date.parse(c.dateCreated);
-      return t>=start && t<=end;
+      return t >= start && t <= end;
     }).length;
   } catch (e) {
     console.error("⚠ Contacts error:", e.response?.data || e.message);
   }
 
-  // — Pipelines via agency key
+  // 2) Pipelines via sub-account key (must use sub-account key)
   let pipelinesList = [];
   try {
     const { data: pData } = await axios.get(
       "https://rest.gohighlevel.com/v1/pipelines/",
-      { headers: agencyHeaders, params: { locationId: loc.id } }
+      {
+        headers: { Authorization: `Bearer ${loc.apiKey}` },
+        params: { locationId: loc.id }
+      }
     );
-    pipelinesList = (pData.pipelines||[]).filter(p=>
+    pipelinesList = (pData.pipelines || []).filter(p =>
       ["Youth","Adult","Leagues"].includes(p.name)
     );
   } catch (e) {
     console.error("⚠ Pipelines error:", e.response?.data || e.message);
   }
 
-  // — Opportunities per pipeline via sub-account key
+  // 3) Opportunities per pipeline
   const combined = { leads, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
   const pipelines = {};
 
@@ -135,11 +132,16 @@ app.get("/stats/:location", async (req, res) => {
       const { data: oData } = await axios.get(
         "https://rest.gohighlevel.com/v1/opportunities/",
         {
-          headers:{ Authorization:`Bearer ${loc.apiKey}` },
-          params:{ locationId: loc.id, pipelineId: p.id, startDate: start, endDate: end }
+          headers: { Authorization: `Bearer ${loc.apiKey}` },
+          params: {
+            locationId: loc.id,
+            pipelineId: p.id,
+            startDate:  start,
+            endDate:    end
+          }
         }
       );
-      const opps   = oData.opportunities||[];
+      const opps = oData.opportunities || [];
       const total   = opps.length;
       const shows   = opps.filter(o=>o.tags?.includes("show")).length;
       const noShows = opps.filter(o=>o.tags?.includes("no-show")).length;
@@ -153,16 +155,17 @@ app.get("/stats/:location", async (req, res) => {
       combined.noShows      += noShows;
       combined.wins         += wins;
       combined.cold         += cold;
-
     } catch (e) {
-      console.error(`⚠ Pipeline ${p.name} error:`, e.response?.data||e.message);
-      pipelines[p.name.toLowerCase()] = { error:true, details:e.response?.data||e.message };
+      console.error(`⚠ Pipeline ${p.name} error:`, e.response?.data || e.message);
+      pipelines[p.name.toLowerCase()] = {
+        error:true, details:e.response?.data||e.message
+      };
     }
   }));
 
-  return res.json({
+  res.json({
     location: loc.name,
-    dateRange: {
+    dateRange:{
       startDate:new Date(start).toISOString().slice(0,10),
       endDate:  new Date(end).toISOString().slice(0,10),
     },
@@ -171,9 +174,10 @@ app.get("/stats/:location", async (req, res) => {
   });
 });
 
-// ——————————————
-// 6) Start server
-// ——————————————
+// Initialize & listen
 initialize()
-  .then(()=> app.listen(PORT, ()=>console.log(`🚀 Listening on port ${PORT}`)))
-  .catch(err=>{ console.error("❌ Init failed:", err); process.exit(1);} );
+  .then(() => app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`)))
+  .catch(err => {
+    console.error("❌ Init failed:", err);
+    process.exit(1);
+  });
