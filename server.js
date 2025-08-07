@@ -11,10 +11,10 @@ const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-// 1) Agency‐level key for listing sub‐accounts
+// 1) Your agency key (to list sub-accounts)
 const AGENCY_KEY = process.env.GHL_API_KEY;
 if (!AGENCY_KEY) {
-  console.error("❌ Missing GHL_API_KEY (agency key)");
+  console.error("❌ Missing GHL_API_KEY");
   process.exit(1);
 }
 const agencyHeaders = {
@@ -22,7 +22,7 @@ const agencyHeaders = {
   "Content-Type": "application/json"
 };
 
-// 2) Load your CSV: slug → private API key
+// 2) Read your CSV (slug → private API key)
 const rawLocations = [];
 fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
   .pipe(csv())
@@ -35,12 +35,13 @@ fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
   })
   .on("end", () => console.log("🔑 Loaded CSV for:", rawLocations.map(r => r.slug)));
 
-// 3) Date‐range helper (defaults to last 30 days)
+// 3) Default date range (last 30 days) or use ?startDate&endDate
 function getDateRange(req) {
   const now = Date.now();
   let start = now - 1000*60*60*24*30, end = now;
   if (req.query.startDate && req.query.endDate) {
-    const s = Date.parse(req.query.startDate), e = Date.parse(req.query.endDate);
+    const s = Date.parse(req.query.startDate),
+          e = Date.parse(req.query.endDate);
     if (!isNaN(s) && !isNaN(e)) {
       start = s;
       end   = e + 86399999;
@@ -49,7 +50,7 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// 4) Helper: fetch ALL contacts for a sub‐account
+// 4) Pull all contacts for a sub-account
 async function fetchAllContacts(apiKey, locationId) {
   const all = [];
   let page = 1, perPage = 50;
@@ -66,7 +67,7 @@ async function fetchAllContacts(apiKey, locationId) {
   return all;
 }
 
-// 5) Helper: fetch ALL opportunities for one pipeline
+// 5) Pull every opportunity in a pipeline (paginated)
 async function fetchAllPipelineOpps(apiKey, locationId, pipelineId) {
   const all = [];
   let page = 1, perPage = 50;
@@ -86,36 +87,35 @@ async function fetchAllPipelineOpps(apiKey, locationId, pipelineId) {
   return all;
 }
 
-// 6) Runtime map: slug → { id, apiKey, pipelines:[{name,id,stageIds}] }
+// 6) Build slug→location map
 const locations = {};
 
-// 7) Initialization: fetch sub-account IDs, merge CSV, discover pipelines & stages
+// 7) Init: list sub-accounts & merge CSV, then discover pipelines
 async function initialize() {
-  // A) list sub‐accounts with agency key
+  // A) list sub-accounts via agency key
   const { data: locData } = await axios.get(
     "https://rest.gohighlevel.com/v1/locations",
     { headers: agencyHeaders }
   );
   const agList = locData.locations || [];
 
-  // B) merge CSV entries into our `locations` map
+  // B) merge with CSV
   for (const raw of rawLocations) {
     const match = agList.find(l =>
       l.name.toLowerCase().includes(raw.csvName.toLowerCase())
     );
     if (!match) {
-      console.warn(`⚠ No GHL match for "${raw.csvName}"`);
+      console.warn(`⚠ No match for "${raw.csvName}"`);
       continue;
     }
     locations[raw.slug] = {
-      id:        match.id,
-      apiKey:    raw.apiKey,
+      id:       match.id,
+      apiKey:   raw.apiKey,
       pipelines: []
     };
   }
-  console.log("✅ Initialized locations:", Object.keys(locations));
 
-  // C) for each sub-account, fetch its pipelines & stage IDs
+  // C) discover each sub-account’s Youth/Adult/Leagues pipelines
   await Promise.all(Object.entries(locations).map(async ([slug, loc]) => {
     const hdr = { Authorization: `Bearer ${loc.apiKey}`, "Content-Type":"application/json" };
     let pipes = [];
@@ -128,26 +128,16 @@ async function initialize() {
     } catch (e) {
       console.error(`❌ pipelines lookup failed for ${slug}:`, e.message);
     }
-    for (const p of pipes.filter(p => ["Youth","Adult","Leagues"].includes(p.name))) {
-      const pi = { name:p.name.toLowerCase(), id:p.id, stageIds:{} };
-      try {
-        const d = await axios.get(
-          `https://rest.gohighlevel.com/v1/pipelines/${p.id}`,
-          { headers: hdr, params: { locationId: loc.id } }
-        );
-        (d.data.pipeline.stages||[]).forEach(s => {
-          pi.stageIds[s.name.toLowerCase().replace(/\s+/g,"-")] = s.id;
-        });
-      } catch (e) {
-        console.warn(`⚠ stages lookup failed for ${slug}/${p.name}:`, e.message);
-      }
-      loc.pipelines.push(pi);
-    }
+    // keep only the three you care about
+    loc.pipelines = pipes
+      .filter(p => ["Youth","Adult","Leagues"].includes(p.name))
+      .map(p => ({ name: p.name.toLowerCase(), id: p.id }));
   }));
-  console.log("✅ Pipelines & stages fetched");
+
+  console.log("✅ Initialization complete:", Object.keys(locations));
 }
 
-// 8) GET /locations → list your slugs
+// 8) GET /locations → available slugs
 app.get("/locations", (req, res) => {
   res.json(Object.keys(locations));
 });
@@ -156,32 +146,35 @@ app.get("/locations", (req, res) => {
 app.get("/stats/:location", async (req, res) => {
   const slug = req.params.location.toLowerCase();
   const loc  = locations[slug];
-  if (!loc) return res.status(404).json({ error: "Location not configured" });
+  if (!loc) {
+    return res.status(404).json({ error: "Unknown location" });
+  }
 
   const { start, end } = getDateRange(req);
 
-  // A) HEADCOUNT Leads via pipeline‐stage
+  // A) HEADCOUNT leads by counting live opps in the “Lead” stage
   const combined = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
   const pipelinesOut = {};
 
   for (const p of loc.pipelines) {
     pipelinesOut[p.name] = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
 
-    // fetch EVERY opp in this pipeline
     let opps = [];
     try {
       opps = await fetchAllPipelineOpps(loc.apiKey, loc.id, p.id);
     } catch (e) {
       console.warn(`⚠ opps fetch failed for ${slug}/${p.name}:`, e.message);
     }
+    // stageName includes “Lead” in that column header
+    const headcount = opps.filter(o =>
+      o.stageName && o.stageName.toLowerCase().includes("lead")
+    ).length;
 
-    // count only those currently in the Lead stage
-    const headcount = opps.filter(o => o.stageId === p.stageIds["lead"]).length;
     pipelinesOut[p.name].leads = headcount;
     combined.leads += headcount;
   }
 
-  // B) Tag‐based Appointments/Shows/etc via Contacts & dateUpdated
+  // B) Tag‐based outcomes via contacts + dateUpdated window
   let contacts = [];
   try {
     contacts = await fetchAllContacts(loc.apiKey, loc.id);
@@ -193,7 +186,7 @@ app.get("/stats/:location", async (req, res) => {
   for (const c of contacts) {
     const updated = Date.parse(c.dateUpdated);
     if (updated < start || updated > end) continue;
-    const tags = (c.tags || []).map(t => t.toLowerCase());
+    const tags   = (c.tags||[]).map(t => t.toLowerCase());
     const member = loc.pipelines.map(p => p.name).filter(n => tags.includes(n));
 
     if (tags.includes("appointment")) {
@@ -218,7 +211,7 @@ app.get("/stats/:location", async (req, res) => {
     }
   }
 
-  // 10) Return assembled JSON
+  // 10) Return your dashboard JSON
   res.json({
     location: slug,
     dateRange: {
@@ -230,9 +223,9 @@ app.get("/stats/:location", async (req, res) => {
   });
 });
 
-// 11) Start server
+// 11) Start the server once everything’s wired up
 initialize()
-  .then(() => app.listen(PORT, () => console.log(`🚀 Dashboard listening on port ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`)))
   .catch(err => {
     console.error("❌ Initialization failed:", err);
     process.exit(1);
