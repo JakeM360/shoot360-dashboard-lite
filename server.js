@@ -11,79 +11,25 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 
-// 1) Agency key for listing sub-accounts
-const AGENCY_API_KEY = process.env.GHL_API_KEY;
-if (!AGENCY_API_KEY) {
-  console.error("❌ Missing GHL_API_KEY");
-  process.exit(1);
-}
+// 1) Load location→API key mapping from CSV
+const locations = [];
+fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
+  .pipe(csv())
+  .on("data", row => {
+    locations.push({
+      slug: row.location.toLowerCase().trim(),
+      apiKey: row.api_key.trim()
+    });
+  })
+  .on("end", () => console.log("🔑 Loaded API keys for:", locations.map(l=>l.slug)));
 
-// In-memory cache
-let locationsCache = [];
-
-// Initialize: load sub-accounts, merge CSV, fetch pipelines & calendars
-async function initialize() {
-  // A) List sub-accounts
-  const locResp = await axios.get(
-    "https://rest.gohighlevel.com/v1/locations",
-    { headers: { Authorization: `Bearer ${AGENCY_API_KEY}`, "Content-Type": "application/json" } }
-  );
-  locationsCache = (locResp.data.locations || []).map(l => ({
-    id:   l.id,
-    name: l.name,
-    slug: l.name.replace(/^Shoot 360\s*-\s*/, "").toLowerCase().replace(/\s+/g, "-"),
-    apiKey:    null,
-    calendars: [],
-    pipelines: []
-  }));
-
-  // B) Merge per-location API key & calendar IDs from CSV
-  await new Promise((resolve, reject) => {
-    fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
-      .pipe(csv())
-      .on("data", row => {
-        const slug = row.location.toLowerCase().trim();
-        const loc  = locationsCache.find(x => x.slug === slug);
-        if (!loc) return;
-        loc.apiKey = row.api_key.trim();
-        loc.calendars = [];
-        if (row.calendar_youth_id)   loc.calendars.push({ name:"youth",   id: row.calendar_youth_id.trim() });
-        if (row.calendar_adult_id)   loc.calendars.push({ name:"adult",   id: row.calendar_adult_id.trim() });
-        if (row.calendar_leagues_id) loc.calendars.push({ name:"leagues", id: row.calendar_leagues_id.trim() });
-      })
-      .on("end", resolve)
-      .on("error", reject);
-  });
-
-  // C) Fetch pipelines for each location using its own API key
-  await Promise.all(locationsCache.map(async loc => {
-    if (!loc.apiKey) return;
-    try {
-      const pResp = await axios.get(
-        "https://rest.gohighlevel.com/v1/pipelines/",
-        {
-          headers: { Authorization: `Bearer ${loc.apiKey}`, "Content-Type": "application/json" },
-          params: { locationId: loc.id }
-        }
-      );
-      loc.pipelines = (pResp.data.pipelines || [])
-        .filter(p => ["Youth","Adult","Leagues"].includes(p.name))
-        .map(p => ({ name:p.name.toLowerCase(), id:p.id }));
-    } catch (e) {
-      console.error(`⚠ Pipelines error for ${loc.slug}:`, e.response?.data || e.message);
-    }
-  }));
-
-  console.log("✅ Initialized:", locationsCache.map(l => l.slug));
-}
-
-// Helper: last-30-days or query params
+// 2) Date-range helper (last 30 days default)
 function getDateRange(req) {
   const now = Date.now();
   let start = now - 1000*60*60*24*30, end = now;
   if (req.query.startDate && req.query.endDate) {
     const s = Date.parse(req.query.startDate), e = Date.parse(req.query.endDate);
-    if (!isNaN(s) && !isNaN(e)) {
+    if (!isNaN(s)&&!isNaN(e)) {
       start = s;
       end   = e + 86399999;
     }
@@ -91,99 +37,133 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// GET /locations
+// 3) Helper to page through all contacts
+async function fetchAllContacts(apiKey, locationId) {
+  const all = [];
+  let page = 1, perPage = 50;
+  while (true) {
+    const resp = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      params: { locationId, page, perPage }
+    });
+    const batch = resp.data.contacts || [];
+    all.push(...batch);
+    if (batch.length < perPage) break;
+    page++;
+  }
+  return all;
+}
+
+// 4) GET /locations → just return the slugs we know
 app.get("/locations", (req, res) => {
-  res.json(locationsCache.map(({ id, name, slug }) => ({ id, name, slug })));
+  res.json(locations.map(l => ({ slug: l.slug })));
 });
 
-// GET /stats/:location
+// 5) GET /stats/:location → contacts-only metrics
 app.get("/stats/:location", async (req, res) => {
-  const loc = locationsCache.find(x => x.slug === req.params.location.toLowerCase());
-  if (!loc)   return res.status(404).json({ error: "Location not found" });
-  if (!loc.apiKey) return res.status(500).json({ error: "Missing API key for this location" });
+  const slug = req.params.location.toLowerCase();
+  const locEntry = locations.find(l => l.slug === slug);
+  if (!locEntry) {
+    return res.status(404).json({ error: "Location not found" });
+  }
 
   const { start, end } = getDateRange(req);
-  const headers = { Authorization: `Bearer ${loc.apiKey}`, "Content-Type": "application/json" };
+  const apiKey = locEntry.apiKey;
 
-  // A) Appointments per calendar (appointments, shows, noShows)
-  let combinedAppointments = 0, combinedShows = 0, combinedNoShows = 0;
-  const calendarsOut = {};
-  await Promise.all(loc.calendars.map(async cal => {
-    try {
-      const { data } = await axios.get(
-        "https://rest.gohighlevel.com/v1/appointments/",
-        { headers, params: { calendarId: cal.id, startDate: start, endDate: end } }
-      );
-      const apps = data.appointments || [];
-      const total = apps.length;
-
-      let shows = 0, noShows = 0;
-      apps.forEach(a => {
-        const st = (a.status || "").toLowerCase();
-        if (st === "show") shows++;
-        else if (st === "no-show" || st === "no show") noShows++;
-      });
-
-      calendarsOut[cal.name] = { appointments: total, shows, noShows };
-      combinedAppointments += total;
-      combinedShows        += shows;
-      combinedNoShows      += noShows;
-    } catch (e) {
-      console.error(`⚠ Appointments error for calendar ${cal.name}:`, e.response?.data || e.message);
-      calendarsOut[cal.name] = { error:true, details:e.response?.data || e.message };
+  // Fetch all contacts for this location
+  let contacts = [];
+  try {
+    // Must know the numeric locationId for the call
+    // We'll extract it from the first page
+    const firstPage = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      params: { page: 1, perPage: 1 }
+    });
+    const locationId = firstPage.data.contacts?.[0]?.locationId;
+    if (!locationId) {
+      throw new Error("Unable to discover locationId from contacts");
     }
-  }));
+    contacts = await fetchAllContacts(apiKey, locationId);
+  } catch (e) {
+    console.error("❌ Contacts fetch failed:", e.response?.data || e.message);
+    return res.status(500).json({ error: "Failed to fetch contacts", details: e.message });
+  }
 
-  // B) Opportunities per pipeline (leads, wins, cold)
-  let combinedLeads = 0, combinedWins = 0, combinedCold = 0;
-  const pipelinesOut = {};
-  await Promise.all(loc.pipelines.map(async p => {
-    try {
-      const { data } = await axios.get(
-        `https://rest.gohighlevel.com/v1/pipelines/${p.id}/opportunities`,
-        { headers, params: { locationId: loc.id, startDate: start, endDate: end } }
-      );
-      const opps = data.opportunities || [];
-      const leads = opps.length;
-      const wins  = opps.filter(o => o.tags?.includes("won")).length;
-      const cold  = opps.filter(o => o.tags?.includes("cold")).length;
-
-      pipelinesOut[p.name] = { leads, wins, cold };
-      combinedLeads += leads;
-      combinedWins  += wins;
-      combinedCold  += cold;
-    } catch (e) {
-      console.error(`⚠ Opportunities error for pipeline ${p.name}:`, e.response?.data || e.message);
-      pipelinesOut[p.name] = { error:true, details:e.response?.data || e.message };
-    }
-  }));
-
-  // C) Combined totals
+  // Set up our buckets
+  const pipelines = ["adult","youth","leagues"];
   const combined = {
-    leads:        combinedLeads,
-    appointments: combinedAppointments,
-    shows:        combinedShows,
-    noShows:      combinedNoShows,
-    wins:         combinedWins,
-    cold:         combinedCold
+    leads: 0,
+    appointments: 0,
+    shows: 0,
+    noShows: 0,
+    wins: 0,
+    cold: 0
   };
+  const byPipeline = {};
+  pipelines.forEach(p => {
+    byPipeline[p] = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
+  });
+
+  // 6) Iterate contacts
+  for (const c of contacts) {
+    const created = Date.parse(c.dateCreated);
+    const updated = Date.parse(c.dateUpdated);
+    const tags = (c.tags || []).map(t => t.toLowerCase());
+
+    // Determine pipelines this contact belongs to
+    const belongsTo = pipelines.filter(p => tags.includes(p));
+    if (belongsTo.length === 0) {
+      // if no explicit pipeline tag, skip entirely
+      continue;
+    }
+
+    // A) Leads = created in window
+    if (created >= start && created <= end) {
+      combined.leads++;
+      belongsTo.forEach(p => byPipeline[p].leads++);
+    }
+
+    // B) Appointments = tag + updated in window
+    if (tags.includes("appointment") && updated >= start && updated <= end) {
+      combined.appointments++;
+      belongsTo.forEach(p => byPipeline[p].appointments++);
+    }
+
+    // C) Shows / No-Shows
+    if ((tags.includes("show") || tags.includes("no-show")) && updated >= start && updated <= end) {
+      if (tags.includes("show")) {
+        combined.shows++;
+        belongsTo.forEach(p => byPipeline[p].shows++);
+      }
+      if (tags.includes("no-show")) {
+        combined.noShows++;
+        belongsTo.forEach(p => byPipeline[p].noShows++);
+      }
+    }
+
+    // D) Wins / Cold
+    if (tags.includes("won") && updated >= start && updated <= end) {
+      combined.wins++;
+      belongsTo.forEach(p => byPipeline[p].wins++);
+    }
+    if (tags.includes("cold") && updated >= start && updated <= end) {
+      combined.cold++;
+      belongsTo.forEach(p => byPipeline[p].cold++);
+    }
+  }
 
   res.json({
-    location: loc.name,
+    location: slug,
     dateRange: {
       startDate: new Date(start).toISOString().slice(0,10),
       endDate:   new Date(end).toISOString().slice(0,10)
     },
     combined,
-    calendars: calendarsOut,
-    pipelines: pipelinesOut
+    pipelines: byPipeline
   });
 });
 
-// Start server
-initialize()
-  .then(() => app.listen(PORT, () => console.log(`🚀 listening on port ${PORT}`)))
-  .catch(err => {
-    console.error("❌ Initialization failed:", err);
-    process.exit(1);
-  });
+// 7) Start
+app.listen(PORT, () => {
+  console.log(`🚀 Contacts-only dashboard listening on port ${PORT}`);
+});
