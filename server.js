@@ -11,7 +11,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 
-// Agency‐level key (only for listing sub‐accounts)
+// ——————————————
+// 1) Agency key (only to list sub-accounts & pipelines)
+// ——————————————
 const AGENCY_API_KEY = process.env.GHL_API_KEY;
 if (!AGENCY_API_KEY) {
   console.error("❌ Missing GHL_API_KEY in environment");
@@ -22,28 +24,28 @@ const agencyHeaders = {
   "Content-Type": "application/json",
 };
 
-// In‐memory cache of locations
+// ——————————————
+// 2) Load and merge sub-accounts + per-location keys
+// ——————————————
 let locationsCache = [];
 
-// STEP A: Initialize – fetch sub‐accounts and merge per‐location API keys
 async function initialize() {
-  // 1) Fetch all sub‐accounts
-  const locResp = await axios.get(
+  // A) List all sub-accounts
+  const { data: locData } = await axios.get(
     "https://rest.gohighlevel.com/v1/locations",
     { headers: agencyHeaders }
   );
-  locationsCache = (locResp.data.locations || []).map((loc) => {
-    // strip "Shoot 360 - " prefix for clean slug
+  locationsCache = (locData.locations || []).map((loc) => {
     const raw = loc.name.replace(/^Shoot 360\s*-\s*/, "");
     return {
-      id:    loc.id,
-      name:  loc.name,
-      slug:  raw.toLowerCase().replace(/\s+/g, "-"),
+      id:   loc.id,
+      name: loc.name,
+      slug: raw.toLowerCase().replace(/\s+/g, "-"),
       apiKey: null,
     };
   });
 
-  // 2) Read your secrets/api_keys.csv and merge apiKey
+  // B) Merge sub-account API keys from CSV
   await new Promise((resolve, reject) => {
     fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
       .pipe(csv())
@@ -56,17 +58,19 @@ async function initialize() {
       .on("error", reject);
   });
 
-  console.log("✅ Locations initialized:", locationsCache.map((l) => l.slug));
+  console.log("✅ Initialized locations:", locationsCache.map((l) => l.slug));
 }
 
-// STEP B: Date range helper (last 30 days default)
+// ——————————————
+// 3) Date range helper
+// ——————————————
 function getDateRange(req) {
   const now = Date.now();
   let start = now - 1000 * 60 * 60 * 24 * 30,
       end   = now;
   if (req.query.startDate && req.query.endDate) {
-    const s = Date.parse(req.query.startDate);
-    const e = Date.parse(req.query.endDate);
+    const s = Date.parse(req.query.startDate),
+          e = Date.parse(req.query.endDate);
     if (!isNaN(s) && !isNaN(e)) {
       start = s;
       end   = e + 86399999;
@@ -75,81 +79,72 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// STEP C: GET /locations → list of { id, name, slug }
+// ——————————————
+// 4) GET /locations
+// ——————————————
 app.get("/locations", (req, res) => {
   res.json(locationsCache.map(({ id, name, slug }) => ({ id, name, slug })));
 });
 
-// STEP D: GET /stats/:location → metrics payload
+// ——————————————
+// 5) GET /stats/:location
+// ——————————————
 app.get("/stats/:location", async (req, res) => {
   const slug = req.params.location.toLowerCase();
   const loc  = locationsCache.find((l) => l.slug === slug);
   if (!loc) return res.status(404).json({ error: "Location not found" });
-  if (!loc.apiKey) return res.status(500).json({ error: "Missing API key for this location" });
+  if (!loc.apiKey) return res.status(500).json({ error: "No API key for this location" });
 
   const { start, end } = getDateRange(req);
-  const headers = {
-    Authorization: `Bearer ${loc.apiKey}`,
-    "Content-Type":  "application/json",
-  };
 
-  // 1) Fetch & filter leads via Contacts endpoint
+  // — Contacts (leads) via sub-account key
   let leads = 0;
   try {
-    const cRes = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
-      headers,
-      params: { locationId: loc.id }
-    });
-    leads = (cRes.data.contacts || []).filter((c) => {
+    const { data: cData } = await axios.get(
+      "https://rest.gohighlevel.com/v1/contacts/",
+      { headers: { Authorization:`Bearer ${loc.apiKey}` }, params:{ locationId: loc.id } }
+    );
+    leads = (cData.contacts || []).filter(c => {
       const t = Date.parse(c.dateCreated);
-      return t >= start && t <= end;
+      return t>=start && t<=end;
     }).length;
   } catch (e) {
     console.error("⚠ Contacts error:", e.response?.data || e.message);
   }
 
-  // 2) Fetch pipelines for this location
+  // — Pipelines via agency key
   let pipelinesList = [];
   try {
-    const pRes = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
-      headers,
-      params: { locationId: loc.id }  // <— pass locationId here!
-    });
-    pipelinesList = (pRes.data.pipelines || []).filter((p) =>
+    const { data: pData } = await axios.get(
+      "https://rest.gohighlevel.com/v1/pipelines/",
+      { headers: agencyHeaders, params: { locationId: loc.id } }
+    );
+    pipelinesList = (pData.pipelines||[]).filter(p=>
       ["Youth","Adult","Leagues"].includes(p.name)
     );
   } catch (e) {
     console.error("⚠ Pipelines error:", e.response?.data || e.message);
   }
 
-  // 3) For each pipeline, fetch & tally opportunities
-  const combined = {
-    leads,
-    appointments: 0,
-    shows:        0,
-    noShows:      0,
-    wins:         0,
-    cold:         0,
-  };
+  // — Opportunities per pipeline via sub-account key
+  const combined = { leads, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
   const pipelines = {};
 
   await Promise.all(pipelinesList.map(async (p) => {
     try {
-      const oRes = await axios.get("https://rest.gohighlevel.com/v1/opportunities/", {
-        headers,
-        params: {
-          locationId: loc.id,  // <— pass locationId here too!
-          pipelineId: p.id,
-          startDate:  start,
-          endDate:    end
+      const { data: oData } = await axios.get(
+        "https://rest.gohighlevel.com/v1/opportunities/",
+        {
+          headers:{ Authorization:`Bearer ${loc.apiKey}` },
+          params:{ locationId: loc.id, pipelineId: p.id, startDate: start, endDate: end }
         }
-      });
-      const opps = oRes.data.opportunities || [];
+      );
+      const opps   = oData.opportunities||[];
       const total   = opps.length;
-      const shows   = opps.filter((o) => o.tags?.includes("show")).length;
-      const noShows = opps.filter((o) => o.tags?.includes("no-show")).length;
-      const wins    = opps.filter((o) => o.tags?.includes("won")).length;
-      const cold    = opps.filter((o) => o.tags?.includes("cold")).length;
+      const shows   = opps.filter(o=>o.tags?.includes("show")).length;
+      const noShows = opps.filter(o=>o.tags?.includes("no-show")).length;
+      const wins    = opps.filter(o=>o.tags?.includes("won")).length;
+      const cold    = opps.filter(o=>o.tags?.includes("cold")).length;
 
       pipelines[p.name.toLowerCase()] = { total, shows, noShows, wins, cold };
 
@@ -158,31 +153,27 @@ app.get("/stats/:location", async (req, res) => {
       combined.noShows      += noShows;
       combined.wins         += wins;
       combined.cold         += cold;
+
     } catch (e) {
-      console.error(`⚠ Pipeline ${p.name} error:`, e.response?.data || e.message);
-      pipelines[p.name.toLowerCase()] = {
-        error:   true,
-        details: e.response?.data || e.message,
-      };
+      console.error(`⚠ Pipeline ${p.name} error:`, e.response?.data||e.message);
+      pipelines[p.name.toLowerCase()] = { error:true, details:e.response?.data||e.message };
     }
   }));
 
-  // 4) Send response
-  res.json({
+  return res.json({
     location: loc.name,
     dateRange: {
-      startDate: new Date(start).toISOString().slice(0,10),
-      endDate:   new Date(end).toISOString().slice(0,10),
+      startDate:new Date(start).toISOString().slice(0,10),
+      endDate:  new Date(end).toISOString().slice(0,10),
     },
     combined,
     pipelines,
   });
 });
 
-// STEP E: Boot up
+// ——————————————
+// 6) Start server
+// ——————————————
 initialize()
-  .then(() => app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`)))
-  .catch((err) => {
-    console.error("❌ Initialization failed:", err);
-    process.exit(1);
-  });
+  .then(()=> app.listen(PORT, ()=>console.log(`🚀 Listening on port ${PORT}`)))
+  .catch(err=>{ console.error("❌ Init failed:", err); process.exit(1);} );
