@@ -1,66 +1,62 @@
-// server.js
 require("dotenv").config();
 const express = require("express");
-const axios   = require("axios");
-const csv     = require("csv-parser");
-const fs      = require("fs");
-const path    = require("path");
-const cors    = require("cors");
+const axios = require("axios");
+const csv = require("csv-parser");
+const fs = require("fs");
+const path = require("path");
+const cors = require("cors");
 
 const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-// -------------------------
-// ENV / Headers
-// -------------------------
-const AGENCY_KEY = process.env.GHL_API_KEY;
+// --- ENV ---
+const AGENCY_KEY = process.env.GHL_AGENCY_KEY || process.env.GHL_API_KEY;
 if (!AGENCY_KEY) {
-  console.error("❌ Missing GHL_API_KEY");
+  console.error("❌ Missing GHL_AGENCY_KEY (or GHL_API_KEY). Set it in Render.");
   process.exit(1);
 }
-const agencyHeaders = { Authorization: `Bearer ${AGENCY_KEY}`, "Content-Type":"application/json" };
+const agencyHeaders = { Authorization: `Bearer ${AGENCY_KEY}`, "Content-Type": "application/json" };
 
-// -------------------------
-// CSV → rawLocations (slug → location key)
-// -------------------------
-const rawLocations = [];
-fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
+// --- CSV: slug -> location-level key ---
+const csvRows = [];
+const CSV_PATH = path.join(__dirname, "secrets", "api_keys.csv");
+/*
+CSV template:
+location,api_key
+Beaverton,<location_api_key_here>
+Vancouver,<location_api_key_here>
+*/
+fs.createReadStream(CSV_PATH)
   .pipe(csv())
-  .on("data", row => {
-    rawLocations.push({
-      csvName: row.location.trim(),
-      slug:    row.location.toLowerCase().trim().replace(/\s+/g, "-"),
-      apiKey:  (row.api_key || "").trim()
-    });
-  })
-  .on("end", () => console.log("🔑 CSV loaded:", rawLocations.map(r=>r.slug)));
+  .on("data", r => csvRows.push({
+    name: r.location.trim(),
+    slug: r.location.toLowerCase().trim().replace(/\s+/g, "-"),
+    apiKey: r.api_key.trim()
+  }))
+  .on("end", () => console.log("🔑 CSV loaded:", csvRows.map(r => r.slug)));
 
-// -------------------------
-// Helpers
-// -------------------------
-function getDateRange(req){
+// --- utils ---
+function dateRange(req) {
   const now = Date.now();
-  let start = now - 1000*60*60*24*30, end = now;
+  let start = now - 1000 * 60 * 60 * 24 * 30;
+  let end = now;
   if (req.query.startDate && req.query.endDate) {
     const s = Date.parse(req.query.startDate);
     const e = Date.parse(req.query.endDate);
     if (!isNaN(s) && !isNaN(e)) {
-      start = s; end = e + 86399999;
+      start = s;
+      end = e + 86399999;
     }
   }
   return { start, end };
 }
-
-async function fetchAllContacts(apiKey, locationId) {
+async function fetchAll(url, headers, params = {}, listKey = "contacts") {
   const all = [];
   let page = 1, perPage = 50;
   while (true) {
-    const resp = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      params:  { locationId, page, perPage }
-    });
-    const batch = resp.data.contacts || [];
+    const { data } = await axios.get(url, { headers, params: { ...params, page, perPage } });
+    const batch = data[listKey] || [];
     all.push(...batch);
     if (batch.length < perPage) break;
     page++;
@@ -68,161 +64,118 @@ async function fetchAllContacts(apiKey, locationId) {
   return all;
 }
 
-async function fetchAllPipelineOpps(apiKey, locationId, pipelineId) {
-  const all = [];
-  let page = 1, perPage = 50;
-  while (true) {
-    const resp = await axios.get(
-      `https://rest.gohighlevel.com/v1/pipelines/${pipelineId}/opportunities`,
-      { headers: { Authorization:`Bearer ${apiKey}` }, params: { locationId, page, perPage } }
-    );
-    const batch = resp.data.opportunities || [];
-    all.push(...batch);
-    if (batch.length < perPage) break;
-    page++;
+// --- runtime store ---
+const LOCS = {}; // slug -> { id, apiKey, pipelines:[{name,id}] }
+
+// --- init: agency locations + pipelines ---
+async function init() {
+  // A) list sub-accounts
+  const { data } = await axios.get("https://rest.gohighlevel.com/v1/locations", { headers: agencyHeaders });
+  const ghLocs = data.locations || [];
+
+  // B) merge CSV keys
+  for (const row of csvRows) {
+    const match = ghLocs.find(l => l.name.toLowerCase().includes(row.name.toLowerCase()));
+    if (!match) { console.warn(`⚠ No GHL match for "${row.name}"`); continue; }
+    LOCS[row.slug] = { id: match.id, apiKey: row.apiKey, pipelines: [] };
   }
-  return all;
-}
+  console.log("✅ Locations:", Object.keys(LOCS));
 
-// simple concurrency limiter (no deps)
-async function runWithLimit(items, limit, worker) {
-  const results = [];
-  let i = 0, active = 0;
-  return new Promise((resolve, reject) => {
-    const startNext = () => {
-      if (i >= items.length && active === 0) return resolve(results);
-      while (active < limit && i < items.length) {
-        const idx = i++; active++;
-        Promise.resolve(worker(items[idx], idx))
-          .then(r => { results[idx] = r; active--; startNext(); })
-          .catch(err => reject(err));
-      }
-    };
-    startNext();
-  });
-}
-
-// -------------------------
-// Runtime store
-// -------------------------
-const locations = {}; // slug -> { id, apiKey, pipelines:[{name,id}] }
-
-// cache { key: { ts, data } }
-const CACHE_TTL_MS = 2 * 60 * 1000; // 2 mins
-const cache = new Map();
-const cacheGet = (key) => {
-  const item = cache.get(key);
-  if (!item) return null;
-  if (Date.now() - item.ts > CACHE_TTL_MS) { cache.delete(key); return null; }
-  return item.data;
-};
-const cacheSet = (key, data) => cache.set(key, { ts: Date.now(), data });
-
-// -------------------------
-// Initialization: agency → locations → pipelines
-// -------------------------
-async function initialize(){
-  const { data: ag } = await axios.get("https://rest.gohighlevel.com/v1/locations", { headers: agencyHeaders });
-  const agList = ag.locations || [];
-
-  for (const raw of rawLocations){
-    const match = agList.find(l => l.name.toLowerCase().includes(raw.csvName.toLowerCase()));
-    if (!match) { console.warn(`⚠ No match for "${raw.csvName}"`); continue; }
-    locations[raw.slug] = { id: match.id, apiKey: raw.apiKey, pipelines: [] };
-  }
-  console.log("✅ Locations ready:", Object.keys(locations));
-
-  // fetch Youth/Adult/Leagues pipelines per location
-  await Promise.all(Object.entries(locations).map(async ([slug, loc])=>{
+  // C) discover Youth/Adult/Leagues pipelines (names must match)
+  await Promise.all(Object.entries(LOCS).map(async ([slug, loc]) => {
     try {
-      const r = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
-        headers: { Authorization:`Bearer ${loc.apiKey}` },
+      const { data } = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
+        headers: { Authorization: `Bearer ${loc.apiKey}` },
         params: { locationId: loc.id }
       });
-      const pipes = (r.data.pipelines||[]).filter(p => ["Youth","Adult","Leagues"].includes(p.name));
-      loc.pipelines = pipes.map(p => ({ name: p.name.toLowerCase(), id: p.id }));
+      loc.pipelines = (data.pipelines || [])
+        .filter(p => ["Youth", "Adult", "Leagues"].includes(p.name))
+        .map(p => ({ name: p.name.toLowerCase(), id: p.id }));
     } catch (e) {
-      console.error(`❌ pipelines lookup failed for ${slug}:`, e.message);
+      console.error(`❌ pipelines lookup failed for ${slug}:`, e.response?.data || e.message);
     }
   }));
   console.log("✅ Pipelines discovered");
 }
 
-// -------------------------
-// Core: compute stats for ONE location
-// -------------------------
-async function computeLocationStats(slug, start, end) {
-  const loc = locations[slug];
+// --- core per-location computation (clean) ---
+async function computeOne(slug, start, end) {
+  const loc = LOCS[slug];
   if (!loc) throw new Error(`Unknown location: ${slug}`);
 
-  const key = `stats:${slug}:${start}:${end}`;
-  const cached = cacheGet(key);
-  if (cached) return cached;
-
   const combined = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
-  const pipelinesOut = {};
-  for (const p of loc.pipelines) {
-    pipelinesOut[p.name] = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
-  }
+  const byPipe = {};
+  loc.pipelines.forEach(p => byPipe[p.name] = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 });
 
-  // A) HEADCOUNT leads — current cards in Lead columns (no date filter)
-  await Promise.all(loc.pipelines.map(async (p)=>{
+  // A) Leads = current headcount in Lead column per pipeline (no date filter)
+  for (const p of loc.pipelines) {
     try {
-      const opps = await fetchAllPipelineOpps(loc.apiKey, loc.id, p.id);
+      const opps = await fetchAll(
+        `https://rest.gohighlevel.com/v1/pipelines/${p.id}/opportunities`,
+        { Authorization: `Bearer ${loc.apiKey}` },
+        { locationId: loc.id },
+        "opportunities"
+      );
       const headcount = opps.filter(o => (o.stageName || "").toLowerCase().includes("lead")).length;
-      pipelinesOut[p.name].leads = headcount;
+      byPipe[p.name].leads = headcount;
       combined.leads += headcount;
     } catch (e) {
-      console.warn(`⚠ opps fetch failed for ${slug}/${p.name}:`, e.message);
+      console.warn(`⚠ opps fetch failed for ${slug}/${p.name}:`, e.response?.data || e.message);
     }
-  }));
-
-  // B) Tag-based outcomes — dateUpdated inside window
-  try {
-    const contacts = await fetchAllContacts(loc.apiKey, loc.id);
-    for (const c of contacts) {
-      const updated = Date.parse(c.dateUpdated);
-      if (updated < start || updated > end) continue;
-      const tags = (c.tags || []).map(t => t.toLowerCase());
-      const member = loc.pipelines.map(p => p.name).filter(n => tags.includes(n)); // adult/youth/leagues
-
-      if (tags.includes("appointment")) { combined.appointments++; member.forEach(n => pipelinesOut[n].appointments++); }
-      if (tags.includes("show"))        { combined.shows++;        member.forEach(n => pipelinesOut[n].shows++); }
-      if (tags.includes("no-show"))     { combined.noShows++;      member.forEach(n => pipelinesOut[n].noShows++); }
-      if (tags.includes("won"))         { combined.wins++;         member.forEach(n => pipelinesOut[n].wins++); }
-      if (tags.includes("cold"))        { combined.cold++;         member.forEach(n => pipelinesOut[n].cold++); }
-    }
-  } catch (e) {
-    console.error(`❌ contacts fetch failed for ${slug}:`, e.message);
   }
 
-  const result = { location: slug, combined, pipelines: pipelinesOut };
-  cacheSet(key, result);
-  return result;
+  // B) Outcomes via contacts + dateUpdated in window
+  let contacts = [];
+  try {
+    contacts = await fetchAll(
+      "https://rest.gohighlevel.com/v1/contacts/",
+      { Authorization: `Bearer ${loc.apiKey}` },
+      { locationId: loc.id },
+      "contacts"
+    );
+  } catch (e) {
+    console.error(`❌ contacts fetch failed for ${slug}:`, e.response?.data || e.message);
+  }
+
+  for (const c of contacts) {
+    const updated = Date.parse(c.dateUpdated);
+    if (isNaN(updated) || updated < start || updated > end) continue;
+
+    const tags = (c.tags || []).map(t => t.toLowerCase());
+    const member = loc.pipelines.map(p => p.name).filter(n => tags.includes(n));
+
+    if (tags.includes("appointment")) { combined.appointments++; member.forEach(n => byPipe[n].appointments++); }
+    if (tags.includes("show"))        { combined.shows++;        member.forEach(n => byPipe[n].shows++); }
+    if (tags.includes("no-show"))     { combined.noShows++;      member.forEach(n => byPipe[n].noShows++); }
+    if (tags.includes("won"))         { combined.wins++;         member.forEach(n => byPipe[n].wins++); }
+    if (tags.includes("cold"))        { combined.cold++;         member.forEach(n => byPipe[n].cold++); }
+  }
+
+  return { location: slug, combined, pipelines: byPipe };
 }
 
-// -------------------------
-// Routes
-// -------------------------
-app.get("/locations", (req,res) => {
-  res.json(Object.entries(locations).map(([slug, v]) => ({ slug, id: v.id })));
+// --- endpoints ---
+app.get("/health", (req,res)=>res.json({ ok:true }));
+
+app.get("/locations", (req,res)=>{
+  res.json(Object.entries(LOCS).map(([slug, v]) => ({ slug, id: v.id })));
 });
 
-// Single location (kept for compatibility)
-app.get("/stats/:location", async (req, res) => {
+// single location
+app.get("/stats/:location", async (req,res)=>{
   const slug = req.params.location.toLowerCase();
-  if (!locations[slug]) return res.status(404).json({ error:"Location not configured" });
-  const { start, end } = getDateRange(req);
+  if (!LOCS[slug]) return res.status(404).json({ error:"Unknown location" });
+  const { start, end } = dateRange(req);
   try {
-    const data = await computeLocationStats(slug, start, end);
+    const r = await computeOne(slug, start, end);
     res.json({
       location: slug,
       dateRange: {
         startDate: new Date(start).toISOString().slice(0,10),
         endDate:   new Date(end).toISOString().slice(0,10)
       },
-      combined: data.combined,
-      pipelines: data.pipelines
+      combined: r.combined,
+      pipelines: r.pipelines
     });
   } catch (e) {
     console.error(e);
@@ -230,34 +183,24 @@ app.get("/stats/:location", async (req, res) => {
   }
 });
 
-// NEW: aggregate across many locations
-// GET /stats?locations=all | beaverton,vancouver&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
-app.get("/stats", async (req, res) => {
-  const { start, end } = getDateRange(req);
-  const allSlugs = Object.keys(locations);
+// aggregate many locations (or all)
+app.get("/stats", async (req,res)=>{
+  const { start, end } = dateRange(req);
   const pick = (req.query.locations || "all").toLowerCase();
-  const slugs = pick === "all" ? allSlugs : pick.split(",").map(s => s.trim()).filter(Boolean);
+  const wanted = pick === "all"
+    ? Object.keys(LOCS)
+    : pick.split(",").map(s=>s.trim()).filter(Boolean).filter(s=>LOCS[s]);
 
-  // safety: strip unknowns
-  const targetSlugs = slugs.filter(s => locations[s]);
-  if (targetSlugs.length === 0) return res.status(400).json({ error:"No valid locations selected" });
+  if (!wanted.length) return res.status(400).json({ error:"No valid locations" });
 
   try {
-    // concurrency limit (e.g., 6 at a time)
-    const results = await runWithLimit(targetSlugs, 6, (slug)=>computeLocationStats(slug, start, end));
-
-    // build combined + breakdowns
-    const total = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
-    const byLocation = {};
+    const results = await Promise.all(wanted.map(slug => computeOne(slug, start, end)));
+    const combined = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
     const byPipeline = { adult:{leads:0,appointments:0,shows:0,noShows:0,wins:0,cold:0},
                          youth:{leads:0,appointments:0,shows:0,noShows:0,wins:0,cold:0},
                          leagues:{leads:0,appointments:0,shows:0,noShows:0,wins:0,cold:0} };
-
     for (const r of results) {
-      byLocation[r.location] = r;
-      // combined totals
-      Object.keys(total).forEach(k => total[k] += r.combined[k] || 0);
-      // by pipeline totals
+      Object.keys(combined).forEach(k => combined[k] += r.combined[k] || 0);
       for (const p of Object.keys(byPipeline)) {
         if (!r.pipelines[p]) continue;
         Object.keys(byPipeline[p]).forEach(k => {
@@ -265,26 +208,23 @@ app.get("/stats", async (req, res) => {
         });
       }
     }
-
     res.json({
-      selection: targetSlugs,
+      selection: wanted,
       dateRange: {
         startDate: new Date(start).toISOString().slice(0,10),
         endDate:   new Date(end).toISOString().slice(0,10)
       },
-      combined: total,
-      byLocation,
-      byPipeline
+      combined,
+      byPipeline,
+      byLocation: Object.fromEntries(results.map(r => [r.location, r]))
     });
   } catch (e) {
-    console.error("❌ aggregate error:", e);
-    res.status(500).json({ error:"Failed to aggregate stats" });
+    console.error(e);
+    res.status(500).json({ error:"Aggregation failed" });
   }
 });
 
-// -------------------------
-// Boot
-// -------------------------
-initialize()
+// boot
+init()
   .then(()=>app.listen(PORT, ()=>console.log(`🚀 Listening on ${PORT}`)))
   .catch(err => { console.error("❌ Init failed:", err); process.exit(1); });
