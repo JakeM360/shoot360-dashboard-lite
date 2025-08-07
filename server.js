@@ -11,19 +11,36 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 
-// --- 1) Load sub-account API keys from CSV
-const locations = [];
-fs.createReadStream(path.join(__dirname,"secrets","api_keys.csv"))
+// 1) Agency key for listing sub-accounts
+const AGENCY_API_KEY = process.env.GHL_AGENCY_KEY;
+if (!AGENCY_API_KEY) {
+  console.error("❌ Missing GHL_AGENCY_KEY");
+  process.exit(1);
+}
+const agencyHeaders = {
+  Authorization: `Bearer ${AGENCY_API_KEY}`,
+  "Content-Type": "application/json"
+};
+
+// 2) Load our CSV data (slug + apiKey + calendar IDs)
+const rawLocations = [];
+fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
   .pipe(csv())
   .on("data", row => {
-    locations.push({
-      slug: row.location.toLowerCase().trim(),
-      apiKey: row.api_key.trim()
+    rawLocations.push({
+      csvName:  row.location.trim(),
+      slug:     row.location.toLowerCase().trim().replace(/\s+/g, "-"),
+      apiKey:   row.api_key.trim(),
+      calendars: [
+        row.calendar_youth_id   ? { name:"youth",   id:row.calendar_youth_id.trim() }   : null,
+        row.calendar_adult_id   ? { name:"adult",   id:row.calendar_adult_id.trim() }   : null,
+        row.calendar_leagues_id ? { name:"leagues", id:row.calendar_leagues_id.trim() } : null,
+      ].filter(Boolean)
     });
   })
-  .on("end", () => console.log("🔑 Loaded API keys for:", locations.map(l=>l.slug)));
+  .on("end", () => console.log("🔑 Loaded CSV for:", rawLocations.map(l=>l.slug)));
 
-// --- 2) Helpers for date range
+// 3) Helper: default last-30-days or query parameters
 function getDateRange(req) {
   const now = Date.now();
   let start = now - 1000*60*60*24*30, end = now;
@@ -37,117 +54,139 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// --- 3) Initialize: for each location, discover pipelines and their stageIds
-const pipelineMap = {}; // slug → [ { name, id, stageIds:{ lead, appointment, "no-show", show, cold } } ]
-async function initializePipelines() {
-  for (let loc of locations) {
+// 4) Initialization: fetch agency locations, merge IDs, discover pipelines & stages
+const locations = {};  // slug → { id, apiKey, calendars, pipelines: [ {name,id,stageIds} ] }
+async function initialize() {
+  // A) Fetch sub-accounts from agency key
+  const { data: locData } = await axios.get(
+    "https://rest.gohighlevel.com/v1/locations",
+    { headers: agencyHeaders }
+  );
+  const agencyList = locData.locations || [];
+
+  // B) Merge CSV entries with agency IDs
+  for (let raw of rawLocations) {
+    const match = agencyList.find(l =>
+      l.name.toLowerCase().includes(raw.csvName.toLowerCase())
+    );
+    if (!match) {
+      console.warn(`⚠ No GHL location found for CSV entry "${raw.csvName}"`);
+      continue;
+    }
+    locations[raw.slug] = {
+      id:        match.id,
+      apiKey:    raw.apiKey,
+      calendars: raw.calendars,
+      pipelines: []
+    };
+  }
+
+  // C) For each location, fetch pipelines & their stages
+  await Promise.all(Object.entries(locations).map(async ([slug, loc]) => {
     const hdr = { Authorization: `Bearer ${loc.apiKey}`, "Content-Type":"application/json" };
 
-    // 3A) fetch all pipelines
-    let pipelines;
+    // 1) list pipelines
+    let pipelines = [];
     try {
       const resp = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
         headers: hdr,
-        params: { locationId: loc.slug } // if slug works; if not, use loc.id by first pulling sub-account list
+        params:  { locationId: loc.id }
       });
       pipelines = resp.data.pipelines || [];
     } catch (e) {
-      console.error(`❌ Failed fetching pipelines for ${loc.slug}:`, e.message);
-      pipelines = [];
+      console.error(`❌ Could not fetch pipelines for ${slug}:`, e.message);
     }
 
-    // 3B) for each pipeline, fetch its stages to map names→ids
-    pipelineMap[loc.slug] = [];
-    for (let p of pipelines) {
-      if (!["Youth","Adult","Leagues"].includes(p.name)) continue;
+    // 2) for each pipeline, fetch its stages
+    for (let p of pipelines.filter(p => ["Youth","Adult","Leagues"].includes(p.name))) {
       let stageIds = {};
       try {
         const detail = await axios.get(`https://rest.gohighlevel.com/v1/pipelines/${p.id}`, {
           headers: hdr,
-          params: { locationId: loc.slug }
+          params:  { locationId: loc.id }
         });
-        const stages = detail.data.pipeline.stages || [];
-        stages.forEach(s => {
+        (detail.data.pipeline.stages || []).forEach(s => {
           stageIds[s.name.toLowerCase().replace(/\s+/g,"-")] = s.id;
         });
       } catch (e) {
-        console.error(`⚠ Failed fetching stages for pipeline ${p.name}:`, e.message);
+        console.error(`⚠ Could not fetch stages for pipeline "${p.name}" at ${slug}:`, e.message);
       }
-      pipelineMap[loc.slug].push({
-        name: p.name.toLowerCase(),
-        id:   p.id,
+      loc.pipelines.push({
+        name:     p.name.toLowerCase(),
+        id:       p.id,
         stageIds
       });
     }
-  }
-  console.log("✅ Pipelines initialized for all locations");
+  }));
+
+  console.log("✅ Initialization complete");
 }
 
-// --- 4) GET /locations
-app.get("/locations", (req,res) => {
-  res.json(locations.map(l=>({ slug:l.slug })));
+// 5) GET /locations  → return available slugs
+app.get("/locations", (req, res) => {
+  res.json(Object.keys(locations));
 });
 
-// --- 5) GET /stats/:location
-app.get("/stats/:location", async (req,res) => {
+// 6) GET /stats/:location → pipeline-stage metrics
+app.get("/stats/:location", async (req, res) => {
   const slug = req.params.location.toLowerCase();
-  const loc  = locations.find(l=>l.slug===slug);
-  if (!loc) return res.status(404).json({ error:"Location not found" });
+  const loc  = locations[slug];
+  if (!loc) {
+    return res.status(404).json({ error: "Location not configured" });
+  }
 
   const { start, end } = getDateRange(req);
   const hdr = { Authorization: `Bearer ${loc.apiKey}`, "Content-Type":"application/json" };
 
-  // Combined counters
+  // Combined totals
   const combined = {
     leads:0, appointments:0, shows:0, noShows:0, cold:0, wins:0
   };
-  // Per-pipeline breakdown
   const pipelinesOut = {};
 
-  // Loop each pipeline
-  for (let p of pipelineMap[slug] || []) {
-    pipelinesOut[p.name] = {
-      leads:0, appointments:0, shows:0, noShows:0, cold:0, wins:0
-    };
+  // Loop over each pipeline
+  for (let p of loc.pipelines) {
+    pipelinesOut[p.name] = { leads:0, appointments:0, shows:0, noShows:0, cold:0, wins:0 };
 
+    // Fetch opportunities in date range
     let opps = [];
     try {
       const resp = await axios.get(
         `https://rest.gohighlevel.com/v1/pipelines/${p.id}/opportunities`,
-        { headers: hdr, params:{ locationId: slug, startDate: start, endDate: end } }
+        {
+          headers: hdr,
+          params: {
+            locationId: loc.id,
+            startDate:  start,
+            endDate:    end
+          }
+        }
       );
       opps = resp.data.opportunities || [];
     } catch (e) {
       console.error(`⚠ Opps fetch failed for ${slug}/${p.name}:`, e.message);
     }
 
-    // Count by stageId
+    // Tally by stageId & tags
     opps.forEach(o => {
       const sid = o.stageId;
       if (sid === p.stageIds["lead"]) {
-        pipelinesOut[p.name].leads++;
-        combined.leads++;
+        pipelinesOut[p.name].leads++;     combined.leads++;
       }
       if (sid === p.stageIds["appointment"]) {
-        pipelinesOut[p.name].appointments++;
-        combined.appointments++;
+        pipelinesOut[p.name].appointments++; combined.appointments++;
       }
       if (sid === p.stageIds["no-show"]) {
-        pipelinesOut[p.name].noShows++;
-        combined.noShows++;
+        pipelinesOut[p.name].noShows++;      combined.noShows++;
       }
       if (sid === p.stageIds["show"]) {
-        pipelinesOut[p.name].shows++;
-        combined.shows++;
+        pipelinesOut[p.name].shows++;        combined.shows++;
       }
       if (sid === p.stageIds["cold"]) {
-        pipelinesOut[p.name].cold++;
-        combined.cold++;
+        pipelinesOut[p.name].cold++;         combined.cold++;
       }
-      // Wins by tag
       if (o.tags?.includes("won")) {
-        pipelinesOut[p.name].wins++;
-        combined.wins++;
+        pipelinesOut[p.name].wins++;         combined.wins++;
       }
     });
   }
@@ -163,12 +202,12 @@ app.get("/stats/:location", async (req,res) => {
   });
 });
 
-// --- 6) Start after pipelines init
-initializePipelines()
+// 7) Run initialization, then start server
+initialize()
   .then(() => {
-    app.listen(PORT, ()=>console.log(`🚀 Dashboard listening on port ${PORT}`));
+    app.listen(PORT, () => console.log(`🚀 Dashboard running on port ${PORT}`));
   })
   .catch(err => {
-    console.error("❌ Initialization failed:", err);
+    console.error("❌ Startup failed:", err);
     process.exit(1);
   });
