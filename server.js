@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-// 1) Agency‐level key for listing sub‐accounts
+// 1) Agency key to list sub-accounts
 const AGENCY_KEY = process.env.GHL_API_KEY;
 if (!AGENCY_KEY) {
   console.error("❌ Missing GHL_API_KEY (agency key)");
@@ -22,33 +22,27 @@ const agencyHeaders = {
   "Content-Type": "application/json"
 };
 
-// 2) Load your CSV: slug → private API key & calendar IDs
+// 2) Load CSV: slug → private API key (we’re not using calendars here)
 const rawLocations = [];
 fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
   .pipe(csv())
   .on("data", row => {
     rawLocations.push({
-      csvName:  row.location.trim(),
-      slug:     row.location.toLowerCase().trim().replace(/\s+/g, "-"),
-      apiKey:   row.api_key.trim(),
-      calendars:[
-        row.calendar_youth_id   ? { name:"youth",   id:row.calendar_youth_id.trim() }   : null,
-        row.calendar_adult_id   ? { name:"adult",   id:row.calendar_adult_id.trim() }   : null,
-        row.calendar_leagues_id ? { name:"leagues", id:row.calendar_leagues_id.trim() } : null
-      ].filter(Boolean)
+      csvName: row.location.trim(),
+      slug:    row.location.toLowerCase().trim().replace(/\s+/g,"-"),
+      apiKey:  row.api_key.trim()
     });
   })
-  .on("end", () => console.log("🔑 CSV loaded:", rawLocations.map(r=>r.slug)));
+  .on("end", () => console.log("🔑 CSV loaded for:", rawLocations.map(r=>r.slug)));
 
-// 3) Date‐range helper (defaults to last 30 days)
-function getDateRange(req) {
+// 3) Date-range helper (defaults to last 30 days)
+function getDateRange(req){
   const now = Date.now();
-  let start = now - 1000*60*60*24*30,
-      end   = now;
-  if (req.query.startDate && req.query.endDate) {
+  let start = now - 1000*60*60*24*30, end = now;
+  if(req.query.startDate && req.query.endDate){
     const s = Date.parse(req.query.startDate),
           e = Date.parse(req.query.endDate);
-    if (!isNaN(s) && !isNaN(e)) {
+    if(!isNaN(s) && !isNaN(e)){
       start = s;
       end   = e + 86399999;
     }
@@ -56,135 +50,152 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// 4) Utility: fetch ALL contacts for a sub‐account
-async function fetchAllContacts(apiKey, locationId) {
+// 4) Fetch ALL contacts for a sub-account (50/page)
+async function fetchAllContacts(apiKey, locationId){
   const all = [];
   let page = 1, perPage = 50;
-  while (true) {
-    const resp = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
-      headers: { Authorization: `Bearer ${apiKey}` },
+  while(true){
+    const r = await axios.get("https://rest.gohighlevel.com/v1/contacts/", {
+      headers: { Authorization:`Bearer ${apiKey}` },
       params:  { locationId, page, perPage }
     });
-    const batch = resp.data.contacts || [];
+    const batch = r.data.contacts||[];
     all.push(...batch);
-    if (batch.length < perPage) break;
+    if(batch.length < perPage) break;
     page++;
   }
   return all;
 }
 
-// 5) Build runtime map: slug → { id, apiKey, calendars }
+// 5) Build runtime map: slug → { id, apiKey, pipelines:[{name,id,stageIds}] }
 const locations = {};
 
-// 6) Initialization: lookup real IDs via agency key & merge CSV
-async function initialize() {
-  // A) fetch sub‐accounts
-  const { data: locData } = await axios.get(
-    "https://rest.gohighlevel.com/v1/locations",
-    { headers: agencyHeaders }
-  );
-  const agencyList = locData.locations || [];
+// 6) Initialization: resolve IDs via agency, merge CSV, fetch pipelines+stages
+async function initialize(){
+  // A) List sub-accounts via agency key
+  const { data: ld } = await axios.get("https://rest.gohighlevel.com/v1/locations", { headers: agencyHeaders });
+  const agList = ld.locations||[];
 
-  // B) merge with CSV entries
-  for (const raw of rawLocations) {
-    const match = agencyList.find(l =>
-      l.name.toLowerCase().includes(raw.csvName.toLowerCase())
-    );
-    if (!match) {
-      console.warn(`⚠ No match for "${raw.csvName}"`);
+  // B) Merge CSV entries
+  for(const raw of rawLocations){
+    const match = agList.find(l => l.name.toLowerCase().includes(raw.csvName.toLowerCase()));
+    if(!match){
+      console.warn(`⚠ No GHL match for "${raw.csvName}"`);
       continue;
     }
-    locations[raw.slug] = {
-      id:        match.id,
-      apiKey:    raw.apiKey,
-      calendars: raw.calendars
-    };
+    locations[raw.slug] = { id:match.id, apiKey:raw.apiKey, pipelines:[] };
   }
 
-  console.log("✅ Initialized locations:", Object.keys(locations));
+  console.log("✅ Merged locations:", Object.keys(locations));
+
+  // C) For each sub-account, fetch pipelines & stage IDs
+  await Promise.all(Object.entries(locations).map(async ([slug,loc])=>{
+    const hdr = { Authorization:`Bearer ${loc.apiKey}`, "Content-Type":"application/json" };
+
+    // 1) List pipelines
+    let pipes = [];
+    try {
+      const r = await axios.get("https://rest.gohighlevel.com/v1/pipelines/", {
+        headers: hdr,
+        params:  { locationId: loc.id }
+      });
+      pipes = r.data.pipelines||[];
+    } catch(e){
+      console.error(`❌ Pipelines lookup failed for ${slug}:`, e.message);
+    }
+
+    // 2) For each Youth/Adult/Leagues, fetch its stages
+    for(const p of pipes.filter(p=>["Youth","Adult","Leagues"].includes(p.name))){
+      const pi = { name:p.name.toLowerCase(), id:p.id, stageIds:{} };
+      try {
+        const d = await axios.get(`https://rest.gohighlevel.com/v1/pipelines/${p.id}`, {
+          headers: hdr,
+          params:  { locationId: loc.id }
+        });
+        (d.data.pipeline.stages||[]).forEach(s=>{
+          pi.stageIds[s.name.toLowerCase().replace(/\s+/g,"-")] = s.id;
+        });
+      } catch(e){
+        console.warn(`⚠ Stages lookup failed for ${slug}/${p.name}:`, e.message);
+      }
+      loc.pipelines.push(pi);
+    }
+  }));
+
+  console.log("✅ Initialization complete");
 }
 
-// 7) GET /locations → list your slugs
-app.get("/locations", (req, res) => {
+// 7) GET /locations → your slugs
+app.get("/locations",(req,res)=>{
   res.json(Object.keys(locations));
 });
 
-// 8) GET /stats/:location → Contacts‐only metrics
-app.get("/stats/:location", async (req, res) => {
+// 8) GET /stats/:location → hybrid metrics
+app.get("/stats/:location", async (req,res)=>{
   const slug = req.params.location.toLowerCase();
   const loc  = locations[slug];
-  if (!loc) {
-    return res.status(404).json({ error: "Location not found" });
-  }
+  if(!loc) return res.status(404).json({ error:"Unknown location" });
 
   const { start, end } = getDateRange(req);
+  const hdr = { Authorization:`Bearer ${loc.apiKey}`, "Content-Type":"application/json" };
 
-  // Fetch all contacts for this sub‐account
+  // A) Pipeline-stage leads
+  const combined = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
+  const pipelinesOut = {};
+  for(const p of loc.pipelines){
+    pipelinesOut[p.name] = { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 };
+    let opps = [];
+    try {
+      const r = await axios.get(`https://rest.gohighlevel.com/v1/pipelines/${p.id}/opportunities`, {
+        headers: hdr,
+        params:  { locationId: loc.id, startDate:start, endDate:end }
+      });
+      opps = r.data.opportunities||[];
+    } catch(e){
+      console.warn(`⚠ Opps fetch failed for ${slug}/${p.name}:`, e.message);
+    }
+    const leadCount = opps.filter(o=>o.stageId===p.stageIds["lead"]).length;
+    pipelinesOut[p.name].leads = leadCount;
+    combined.leads += leadCount;
+  }
+
+  // B) Contact-tag metrics (only if updated in window)
   let contacts = [];
   try {
     contacts = await fetchAllContacts(loc.apiKey, loc.id);
-  } catch (e) {
-    console.error("❌ Contacts fetch error:", e.message);
-    return res.status(500).json({ error: "Failed to fetch contacts" });
+  } catch(e){
+    console.error("❌ Contacts fetch failed:", e.message);
+    return res.status(500).json({ error:"Contacts fetch failed" });
   }
-
-  // 9) Prepare accumulators
-  const combined = {
-    leads: 0,
-    appointments: 0,
-    shows: 0,
-    noShows: 0,
-    wins: 0,
-    cold: 0
-  };
-  const pipelines = {
-    adult:   { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 },
-    youth:   { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 },
-    leagues: { leads:0, appointments:0, shows:0, noShows:0, wins:0, cold:0 }
-  };
-
-  // 10) Iterate contacts
-  for (const c of contacts) {
+  for(const c of contacts){
     const updated = Date.parse(c.dateUpdated);
-    const tags    = (c.tags || []).map(t => t.toLowerCase());
+    if(updated < start || updated > end) continue;
+    const tags = (c.tags||[]).map(t=>t.toLowerCase());
+    const member = loc.pipelines.map(p=>p.name).filter(n=>tags.includes(n));
 
-    // Determine pipeline membership via tags
-    const memberPipes = ["adult", "youth", "leagues"].filter(p => tags.includes(p));
-
-    // A) Leads: **everyone** ever in contacts, by pipeline tag
-    memberPipes.forEach(p => {
-      pipelines[p].leads++;
-      combined.leads++;
-    });
-
-    // B) Appointments (tag + in window)
-    if (tags.includes("appointment") && updated >= start && updated <= end) {
-      memberPipes.forEach(p => pipelines[p].appointments++);
+    if(tags.includes("appointment")){
       combined.appointments++;
+      member.forEach(n=>pipelinesOut[n].appointments++);
     }
-
-    // C) Shows / No-Shows (tag + in window)
-    if (tags.includes("show") && updated >= start && updated <= end) {
-      memberPipes.forEach(p => pipelines[p].shows++);
+    if(tags.includes("show")){
       combined.shows++;
+      member.forEach(n=>pipelinesOut[n].shows++);
     }
-    if (tags.includes("no-show") && updated >= start && updated <= end) {
-      memberPipes.forEach(p => pipelines[p].noShows++);
+    if(tags.includes("no-show")){
       combined.noShows++;
+      member.forEach(n=>pipelinesOut[n].noShows++);
     }
-
-    // D) Wins / Cold (tag + in window)
-    if (tags.includes("won") && updated >= start && updated <= end) {
-      memberPipes.forEach(p => pipelines[p].wins++);
+    if(tags.includes("won")){
       combined.wins++;
+      member.forEach(n=>pipelinesOut[n].wins++);
     }
-    if (tags.includes("cold") && updated >= start && updated <= end) {
-      memberPipes.forEach(p => pipelines[p].cold++);
+    if(tags.includes("cold")){
       combined.cold++;
+      member.forEach(n=>pipelinesOut[n].cold++);
     }
   }
 
-  // 11) Return assembled JSON
+  // 9) Return JSON
   res.json({
     location: slug,
     dateRange: {
@@ -192,14 +203,11 @@ app.get("/stats/:location", async (req, res) => {
       endDate:   new Date(end).toISOString().slice(0,10)
     },
     combined,
-    pipelines
+    pipelines: pipelinesOut
   });
 });
 
-// 12) Start up
+// 10) Boot
 initialize()
-  .then(() => app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`)))
-  .catch(err => {
-    console.error("❌ Initialization failed:", err);
-    process.exit(1);
-  });
+  .then(()=> app.listen(PORT,()=>console.log(`🚀 listening on port ${PORT}`)))
+  .catch(err=>{ console.error("❌ Init failed:", err); process.exit(1); });
