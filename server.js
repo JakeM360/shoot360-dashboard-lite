@@ -11,7 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 
-// 1) Agency‐level key (for listing sub‐accounts)
+// 1) Agency key (for listing sub‐accounts)
 const AGENCY_API_KEY = process.env.GHL_API_KEY;
 if (!AGENCY_API_KEY) {
   console.error("❌ Missing GHL_API_KEY in environment");
@@ -22,49 +22,54 @@ const agencyHeaders = {
   "Content-Type": "application/json",
 };
 
-// In‐memory cache of locations
+// In‐memory cache
 let locationsCache = [];
 
-// 2) Initialize: fetch sub‐accounts, merge CSV keys, fetch per‐location pipelines
+// 2) Initialization: load locations, merge keys, fetch pipelines
 async function initialize() {
-  // A: fetch all sub‐accounts
+  // A) List all sub‐accounts with agency key
   const { data: locData } = await axios.get(
     "https://rest.gohighlevel.com/v1/locations",
     { headers: agencyHeaders }
   );
-  locationsCache = (locData.locations || []).map((loc) => {
+  locationsCache = (locData.locations || []).map(loc => {
+    // strip prefix for clean slug
     const raw = loc.name.replace(/^Shoot 360\s*-\s*/, "");
     return {
       id:       loc.id,
       name:     loc.name,
       slug:     raw.toLowerCase().replace(/\s+/g, "-"),
       apiKey:   null,
-      pipelines: []
+      pipelines: [],            // will populate below
     };
   });
 
-  // B: merge per‐location API keys from CSV
+  // B) Merge per‐location API keys from CSV
   await new Promise((resolve, reject) => {
     fs.createReadStream(path.join(__dirname, "secrets", "api_keys.csv"))
       .pipe(csv())
-      .on("data", (row) => {
+      .on("data", row => {
         const slug = row.location.toLowerCase().trim();
-        const loc  = locationsCache.find((l) => l.slug === slug);
+        const loc  = locationsCache.find(l => l.slug === slug);
         if (loc) loc.apiKey = row.api_key.trim();
       })
       .on("end", resolve)
       .on("error", reject);
   });
 
-  // C: for each location, fetch its pipelines using the sub‐account key
-  await Promise.all(locationsCache.map(async (loc) => {
+  // C) For each location with an API key, fetch its pipelines
+  await Promise.all(locationsCache.map(async loc => {
     if (!loc.apiKey) return;
+    const locHeaders = {
+      Authorization: `Bearer ${loc.apiKey}`,
+      "Content-Type": "application/json"
+    };
     try {
       const { data: pData } = await axios.get(
-        "https://rest.gohighlevel.com/v1/pipelines",
+        "https://rest.gohighlevel.com/v1/pipelines/",
         {
-          headers: { Authorization: `Bearer ${loc.apiKey}` },
-          params:  { locationId: loc.id }
+          headers: locHeaders,
+          params: { locationId: loc.id }
         }
       );
       loc.pipelines = (pData.pipelines || [])
@@ -72,20 +77,20 @@ async function initialize() {
         .map(p => ({ name: p.name.toLowerCase(), id: p.id }));
     } catch (e) {
       console.error(`⚠ Pipelines fetch error for ${loc.slug}:`, e.response?.data || e.message);
+      loc.pipelines = [];
     }
   }));
 
   console.log("✅ Initialized locations:", locationsCache.map(l => l.slug));
 }
 
-// 3) Helper: date range (last 30 days default)
+// 3) Date range helper (last 30 days default)
 function getDateRange(req) {
   const now = Date.now();
-  let start = now - 1000 * 60 * 60 * 24 * 30,
-      end   = now;
+  let start = now - 1000*60*60*24*30, end = now;
   if (req.query.startDate && req.query.endDate) {
-    const s = Date.parse(req.query.startDate),
-          e = Date.parse(req.query.endDate);
+    const s = Date.parse(req.query.startDate);
+    const e = Date.parse(req.query.endDate);
     if (!isNaN(s) && !isNaN(e)) {
       start = s;
       end   = e + 86399999;
@@ -94,7 +99,7 @@ function getDateRange(req) {
   return { start, end };
 }
 
-// 4) GET /locations → { id, name, slug }
+// 4) GET /locations → sidebar data
 app.get("/locations", (req, res) => {
   res.json(locationsCache.map(({ id, name, slug }) => ({ id, name, slug })));
 });
@@ -109,11 +114,11 @@ app.get("/stats/:location", async (req, res) => {
   const { start, end } = getDateRange(req);
   const authHeader = { Authorization: `Bearer ${loc.apiKey}` };
 
-  // a) Leads via Contacts
+  // A) Fetch & filter leads via Contacts
   let leads = 0;
   try {
     const { data: cData } = await axios.get(
-      "https://rest.gohighlevel.com/v1/contacts",
+      "https://rest.gohighlevel.com/v1/contacts/",
       { headers: authHeader, params: { locationId: loc.id } }
     );
     leads = (cData.contacts || []).filter(c => {
@@ -124,14 +129,21 @@ app.get("/stats/:location", async (req, res) => {
     console.error("⚠ Contacts error:", e.response?.data || e.message);
   }
 
-  // b) Opportunities per pipeline
-  const combined = { leads, appointments: 0, shows: 0, noShows: 0, wins: 0, cold: 0 };
+  // B) Loop each pipeline from initialize()
+  const combined = {
+    leads,
+    appointments: 0,
+    shows:        0,
+    noShows:      0,
+    wins:         0,
+    cold:         0,
+  };
   const pipelines = {};
 
-  await Promise.all(loc.pipelines.map(async (p) => {
+  await Promise.all(loc.pipelines.map(async p => {
     try {
       const { data: oData } = await axios.get(
-        "https://rest.gohighlevel.com/v1/opportunities",
+        "https://rest.gohighlevel.com/v1/opportunities/",
         {
           headers: authHeader,
           params: {
@@ -143,6 +155,7 @@ app.get("/stats/:location", async (req, res) => {
         }
       );
       const opps = oData.opportunities || [];
+
       const total   = opps.length;
       const shows   = opps.filter(o => o.tags?.includes("show")).length;
       const noShows = opps.filter(o => o.tags?.includes("no-show")).length;
@@ -162,7 +175,7 @@ app.get("/stats/:location", async (req, res) => {
     }
   }));
 
-  res.json({
+  return res.json({
     location: loc.name,
     dateRange: {
       startDate: new Date(start).toISOString().slice(0,10),
@@ -173,7 +186,7 @@ app.get("/stats/:location", async (req, res) => {
   });
 });
 
-// 6) Start server after init
+// 6) Start up
 initialize()
   .then(() => app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`)))
   .catch(err => {
